@@ -1,0 +1,5 @@
+/.pnpm-store/
+/target/
+/apps/macos-host/gen/schemas/
+/apps/macos-host/target/
+.DS_Store
