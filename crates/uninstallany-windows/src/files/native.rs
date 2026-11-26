@@ -210,7 +210,9 @@ pub(crate) fn walk(path: &LocalPath, access: u32, share: u32) -> io::Result<Path
         let request = if is_leaf {
             OpenRequest::existing(access, share, 0)
         } else {
-            OpenRequest::existing(FILE_TRAVERSE, SHARE_DIRECTORY, FILE_DIRECTORY_FILE)
+            // NtCreateFile limits the flags that can accompany FILE_DIRECTORY_FILE.
+            // Keep the no-follow open and check this handle before using it as a parent.
+            OpenRequest::existing(FILE_TRAVERSE, SHARE_DIRECTORY, 0)
         };
         let child = match open_child(parent, part, request) {
             Ok(child) => child,
@@ -818,13 +820,17 @@ mod tests {
         let occupied = destination.join("occupied.txt");
         fs::write(&occupied, b"existing test fixture")?;
 
-        let source_file = open(&LocalPath::parse(&original)?, DELETE, FILE_SHARE_READ)?;
-        let before = identity(source_file.leaf())?;
+        let source_path = LocalPath::parse(&original)?;
+        open_root(source_path.drive, FILE_TRAVERSE).expect("open the fixture volume root");
+        let source_file = open(&source_path, DELETE, FILE_SHARE_READ)
+            .expect("open the fixture source through its guarded ancestors");
+        let before = identity(source_file.leaf()).expect("read the original file identity");
         let destination_dir = open(
             &LocalPath::parse(&destination)?,
             FILE_TRAVERSE,
             SHARE_DIRECTORY,
-        )?;
+        )
+        .expect("open the fixture destination directory");
         assert_eq!(
             rename(
                 source_file.leaf(),
@@ -841,7 +847,8 @@ mod tests {
             source_file.leaf(),
             destination_dir.leaf(),
             OsStr::new("moved.txt"),
-        )?;
+        )
+        .expect("rename into the unoccupied destination");
         assert_eq!(identity(source_file.leaf())?, before);
         assert!(!original.try_exists()?);
         assert_eq!(
