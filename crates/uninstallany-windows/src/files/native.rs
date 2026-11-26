@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_NO_RECALL,
-    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE,
@@ -22,12 +23,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_BASIC_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
-    FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FileAttributeTagInfo,
-    FileBasicInfo, FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
-    FileIdInfo, FileRenameInfo, FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx,
-    GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
-    OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_DOS,
+    FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FileAttributeTagInfo, FileBasicInfo,
+    FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileIdInfo,
+    FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    GetVolumeInformationByHandleW, MAXIMUM_REPARSE_DATA_BUFFER_SIZE, OPEN_EXISTING, SYNCHRONIZE,
+    SetFileInformationByHandle, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
@@ -627,30 +628,45 @@ pub(super) fn rename(
     destination: &OwnedHandle,
     name: &OsStr,
 ) -> io::Result<()> {
-    let mut name = wide(name);
+    let name = wide(name);
     validate_component(&name)?;
-    let info = FILE_RENAME_INFO {
+    let name_length = size_of_val(name.as_slice());
+    let info = FILE_RENAME_INFORMATION {
         RootDirectory: raw(destination),
-        FileNameLength: (name.len() * size_of::<u16>()) as u32,
-        ..FILE_RENAME_INFO::default()
+        FileNameLength: u32::try_from(name_length)
+            .expect("validated names contain at most 255 UTF-16 units"),
+        ..FILE_RENAME_INFORMATION::default()
     };
-    name.push(0);
-    let name_offset = offset_of!(FILE_RENAME_INFO, FileName);
-    let byte_count = size_of::<FILE_RENAME_INFO>() + name.len() * size_of::<u16>();
+    // The Win32 wrapper can reject handle-relative renames. The native
+    // operation resolves the leaf relative to the already-checked handle.
+    let name_offset = offset_of!(FILE_RENAME_INFORMATION, FileName);
+    let byte_count = size_of::<FILE_RENAME_INFORMATION>() + name_length;
     let mut buffer = vec![0_usize; byte_count.div_ceil(size_of::<usize>())];
     let bytes = buffer.as_mut_ptr().cast::<u8>();
-    // SAFETY: The aligned, zeroed allocation is large enough for both the header and name.
-    // Default leaves ReplaceIfExists false. Only the supplied directory handle is resolved.
-    let success = unsafe {
-        bytes.cast::<FILE_RENAME_INFO>().write(info);
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let length =
+        u32::try_from(byte_count).expect("the rename header and validated name fit in u32");
+    // SAFETY: The aligned buffer contains the header and name, and both handles
+    // remain live for the synchronous call. Default leaves ReplaceIfExists false.
+    let status = unsafe {
+        bytes.cast::<FILE_RENAME_INFORMATION>().write(info);
         bytes
             .add(name_offset)
             .cast::<u16>()
             .copy_from_nonoverlapping(name.as_ptr(), name.len());
-        SetFileInformationByHandle(raw(source), FileRenameInfo, bytes.cast(), byte_count as u32)
+        NtSetInformationFile(
+            raw(source),
+            &mut io_status,
+            bytes.cast(),
+            length,
+            FileRenameInformation,
+        )
     };
-    if success == 0 {
-        Err(io::Error::last_os_error())
+    if status < 0 {
+        // SAFETY: status is the result of the native rename operation.
+        Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ))
     } else {
         Ok(())
     }
@@ -809,13 +825,15 @@ mod tests {
             FILE_TRAVERSE,
             SHARE_DIRECTORY,
         )?;
-        assert!(
+        assert_eq!(
             rename(
                 source_file.leaf(),
                 destination_dir.leaf(),
                 OsStr::new("occupied.txt")
             )
-            .is_err()
+            .expect_err("an occupied destination must reject the rename")
+            .kind(),
+            io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(&occupied)?, b"existing test fixture");
         assert_eq!(fs::read(&original)?, b"original test fixture");
