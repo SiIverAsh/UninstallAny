@@ -1,0 +1,22 @@
+[[permission]]
+identifier = "uninstall-workflow"
+description = "Read applications, confirm stages of an uninstall, and restore quarantined files."
+commands.allow = [
+  "list_applications",
+  "load_preferences",
+  "set_retention",
+  "review_uninstall",
+  "run_uninstall",
+  "apply_cleanup",
+  "list_backups",
+  "review_restore",
+  "run_restore",
+  "review_expiry",
+  "purge_expired",
+  "cancel_operation",
+]
+
+[[permission]]
+identifier = "system-helper-activation"
+description = "Review and approve a signed helper registration separately from uninstall."
+commands.allow = ["review_system_helper_activation", "run_system_helper_activation"]

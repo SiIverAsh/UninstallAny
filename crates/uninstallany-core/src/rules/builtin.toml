@@ -1,0 +1,57 @@
+version = 1
+
+[[rules]]
+id = "chrome-windows-cache"
+scope = "windows"
+app_match = { kind = "publisher_and_name", publisher = "Google LLC", name = "Google Chrome" }
+root_id = "windows_local_app_data"
+relative_path = "Google/Chrome/User Data/Default/Cache"
+evidence = "Chrome's default profile cache inside its Windows user-data directory."
+
+[[rules]]
+id = "chrome-macos-cache"
+scope = "macos"
+app_match = { kind = "macos_bundle", id = "com.google.Chrome" }
+root_id = "macos_caches"
+relative_path = "Google/Chrome/Default/Cache"
+evidence = "Chrome's default profile cache inside the macOS user caches directory."
+
+[[rules]]
+id = "firefox-macos-profiles"
+scope = "macos"
+app_match = { kind = "macos_bundle", id = "org.mozilla.firefox" }
+root_id = "macos_application_support"
+relative_path = "Firefox/Profiles"
+evidence = "Mozilla's documented default profile location for bookmarks, preferences, and other browser data."
+
+[[rules]]
+id = "firefox-macos-profile-cache"
+scope = "macos"
+app_match = { kind = "macos_bundle", id = "org.mozilla.firefox" }
+root_id = "macos_caches"
+relative_path = "Firefox/Profiles"
+evidence = "Firefox's default macOS directory for per-profile caches."
+
+[[rules]]
+id = "vscode-macos-user-settings"
+scope = "macos"
+app_match = { kind = "macos_bundle", id = "com.microsoft.VSCode" }
+root_id = "macos_application_support"
+relative_path = "Code/User"
+evidence = "Microsoft's documented default location for VS Code user settings and settings profiles."
+
+[[rules]]
+id = "zotero-macos-profiles"
+scope = "macos"
+app_match = { kind = "macos_bundle", id = "org.zotero.zotero" }
+root_id = "macos_application_support"
+relative_path = "Zotero/Profiles"
+evidence = "Zotero's documented default profile location on macOS."
+
+[[rules]]
+id = "chromium-pacman-cache"
+scope = "linux"
+app_match = { kind = "linux_package", manager = "pacman", id = "chromium" }
+root_id = "linux_cache"
+relative_path = "chromium/Default/Cache"
+evidence = "Chromium's default profile cache under the user's XDG cache directory."

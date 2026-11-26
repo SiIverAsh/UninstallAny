@@ -1,0 +1,11 @@
+{
+  "identifier": "main-window",
+  "description": "The local application window can run the uninstall workflow and listen for progress.",
+  "windows": ["main"],
+  "permissions": [
+    "uninstall-workflow",
+    "system-helper-activation",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

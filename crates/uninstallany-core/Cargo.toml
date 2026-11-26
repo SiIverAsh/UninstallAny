@@ -1,0 +1,15 @@
+[package]
+name = "uninstallany-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile = "3"
+thiserror.workspace = true
+toml = { version = "0.9.12", default-features = false, features = ["parse", "serde", "std"] }
+uuid.workspace = true
+

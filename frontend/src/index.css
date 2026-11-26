@@ -1,0 +1,311 @@
+@import "tailwindcss";
+
+@layer base {
+  :root,
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg-page: #0b0e14;
+    --bg-sidebar: #0f131b;
+    --bg-surface: #131823;
+    --bg-surface-alt: #181e2b;
+    --bg-hover: #1d2536;
+    --bg-pressed: #242e42;
+    --bg-popover: #161c29;
+    --bg-track: #0b0e14;
+    --bg-input: #0f141e;
+    --bg-disabled: #171c27;
+    --bg-row-selected: rgba(59, 130, 246, 0.13);
+    --bg-row-selected-hover: rgba(59, 130, 246, 0.19);
+    --bg-row-readonly: #111620;
+
+    --border-line: #232b3b;
+    --border-soft: #1b2230;
+    --border-control: #2d374b;
+    --border-control-hover: #42506d;
+
+    --text-ink: #f1f5f9;
+    --text-muted: #94a3b8;
+    --text-subtle: #64748b;
+    --text-disabled: #475569;
+
+    --accent: #3b82f6;
+    --accent-hover: #2563eb;
+    --accent-active: #1d4ed8;
+    --accent-text: #60a5fa;
+    --accent-pale: rgba(59, 130, 246, 0.15);
+    --accent-pale-hover: rgba(59, 130, 246, 0.22);
+    --accent-soft: rgba(59, 130, 246, 0.08);
+    --accent-border: rgba(96, 165, 250, 0.36);
+
+    --success-text: #34d399;
+    --success-bg: rgba(16, 185, 129, 0.14);
+    --success-border: rgba(52, 211, 153, 0.28);
+
+    --warning-text: #fbbf24;
+    --warning-bg: rgba(245, 158, 11, 0.14);
+    --warning-border: rgba(251, 191, 36, 0.3);
+
+    --danger: #ef4444;
+    --danger-hover: #dc2626;
+    --danger-active: #b91c1c;
+    --danger-text: #f87171;
+    --danger-bg: rgba(239, 68, 68, 0.14);
+    --danger-bg-hover: rgba(239, 68, 68, 0.22);
+    --danger-border: rgba(248, 113, 113, 0.32);
+
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02);
+    --shadow-popover: 0 14px 36px rgba(0, 0, 0, 0.55);
+    --shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.65);
+    --shadow-toast: 0 12px 32px rgba(0, 0, 0, 0.5);
+    --backdrop: rgba(4, 7, 13, 0.68);
+  }
+
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg-page: #f7f8fa;
+    --bg-sidebar: #f2f4f7;
+    --bg-surface: #ffffff;
+    --bg-surface-alt: #f9fafb;
+    --bg-hover: #f3f5f8;
+    --bg-pressed: #eaedf3;
+    --bg-popover: #ffffff;
+    --bg-track: #e9ecf1;
+    --bg-input: #ffffff;
+    --bg-disabled: #f2f4f7;
+    --bg-row-selected: #eff6ff;
+    --bg-row-selected-hover: #e5effe;
+    --bg-row-readonly: #fafafb;
+
+    --border-line: #e4e7ec;
+    --border-soft: #eef0f4;
+    --border-control: #d0d5dd;
+    --border-control-hover: #98a2b3;
+
+    --text-ink: #101828;
+    --text-muted: #475467;
+    --text-subtle: #667085;
+    --text-disabled: #98a2b3;
+
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --accent-active: #1e40af;
+    --accent-text: #2563eb;
+    --accent-pale: #eff6ff;
+    --accent-pale-hover: #e0edff;
+    --accent-soft: #f5f8ff;
+    --accent-border: #93c5fd;
+
+    --success-text: #047857;
+    --success-bg: #ecfdf5;
+    --success-border: #a7f3d0;
+
+    --warning-text: #b45309;
+    --warning-bg: #fffbeb;
+    --warning-border: #fde68a;
+
+    --danger: #dc2626;
+    --danger-hover: #b91c1c;
+    --danger-active: #991b1b;
+    --danger-text: #dc2626;
+    --danger-bg: #fef2f2;
+    --danger-bg-hover: #fee2e2;
+    --danger-border: #fca5a5;
+
+    --shadow-card: 0 1px 3px rgba(16, 24, 40, 0.05);
+    --shadow-popover: 0 10px 28px rgba(16, 24, 40, 0.14);
+    --shadow-modal: 0 18px 48px rgba(16, 24, 40, 0.22);
+    --shadow-toast: 0 8px 24px rgba(16, 24, 40, 0.14);
+    --backdrop: rgba(16, 24, 40, 0.42);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+    font-family:
+      -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--text-ink);
+    background-color: var(--bg-page);
+    user-select: none;
+  }
+
+  ::selection {
+    background-color: var(--accent-pale);
+    color: var(--accent-text);
+  }
+
+  input,
+  textarea,
+  code,
+  pre {
+    user-select: text;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom sleek desktop scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.24);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.44);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+@keyframes page-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes modal-backdrop-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes modal-backdrop-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes modal-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes modal-panel-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes toast-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+}
+
+@keyframes indeterminate-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
+/* Fill-mode `backwards` ensures no lingering transform containing block after enter finishes */
+.animate-page-enter {
+  animation: page-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+.animate-modal-backdrop {
+  animation: modal-backdrop-in 150ms ease-out backwards;
+}
+
+.animate-modal-backdrop-out {
+  animation: modal-backdrop-out 140ms ease-in forwards;
+}
+
+.animate-modal-panel {
+  animation: modal-panel-in 175ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+.animate-modal-panel-out {
+  animation: modal-panel-out 140ms ease-in forwards;
+}
+
+.animate-toast-in {
+  animation: toast-in 185ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+.animate-toast-out {
+  animation: toast-out 160ms ease-in forwards;
+}
+
+.animate-indeterminate {
+  animation: indeterminate-sweep 1.25s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-page-enter,
+  .animate-modal-backdrop,
+  .animate-modal-backdrop-out,
+  .animate-modal-panel,
+  .animate-modal-panel-out,
+  .animate-toast-in,
+  .animate-toast-out {
+    animation-duration: 1ms !important;
+  }
+
+  .animate-ping {
+    animation: none !important;
+  }
+
+  .animate-indeterminate {
+    animation: none !important;
+    width: 100% !important;
+    opacity: 0.55;
+  }
+}

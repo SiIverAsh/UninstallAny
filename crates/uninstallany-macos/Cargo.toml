@@ -1,0 +1,21 @@
+[package]
+name = "uninstallany-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+privileged-inspection = []
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9.4"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSFileManager", "NSPathUtilities", "NSString", "NSURL"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uninstallany-core = { path = "../uninstallany-core" }
+uninstallany-unix = { path = "../uninstallany-unix" }
+uuid.workspace = true
+

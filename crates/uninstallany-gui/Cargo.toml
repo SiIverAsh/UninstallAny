@@ -1,0 +1,25 @@
+[package]
+name = "uninstallany-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+macos-privileged-helper = ["uninstallany-macos/privileged-inspection"]
+
+[dependencies]
+eframe = { version = "0.31.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+fontdb = "0.24"
+sys-locale = "0.3"
+ttf-parser = "0.25"
+uninstallany-core = { path = "../uninstallany-core" }
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+uninstallany-windows = { path = "../uninstallany-windows" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+uninstallany-macos = { path = "../uninstallany-macos" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+uninstallany-linux = { path = "../uninstallany-linux" }

@@ -1,0 +1,28 @@
+{
+  "productName": "UninstallAny",
+  "version": "0.1.0",
+  "identifier": "io.github.siiverash.uninstallany",
+  "build": {
+    "frontendDist": "../../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "UninstallAny",
+        "width": 1160,
+        "height": 760,
+        "minWidth": 800,
+        "minHeight": 540
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; object-src 'none'; frame-src 'none'",
+      "capabilities": ["main-window"]
+    }
+  },
+  "bundle": {
+    "active": false,
+    "macOS": { "minimumSystemVersion": "13.0" }
+  }
+}
