@@ -1,29 +1,33 @@
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroU16,
+    path::Path,
 };
 
+#[cfg(windows)]
+use uninstallany_core::Access;
+#[cfg(not(all(target_os = "macos", feature = "macos-privileged-helper")))]
+use uninstallany_core::ExpiryCleanupPlan as ExpiryPlan;
 use uninstallany_core::{
     AppId, Cancellation, ChangeReport, ChangeResult, CleanupAttempt, CleanupPlan, Engine, Error,
     Journal, LoadedPreferences, OfficialOutcome, PlatformBackend, PreparedUninstall, RestorePlan,
     Result,
 };
-#[cfg(feature = "macos-privileged-helper")]
+#[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
 use uninstallany_core::{BackupInventory, RecoveryState};
-use uninstallany_macos::MacExpiryPlan;
-#[cfg(feature = "macos-privileged-helper")]
+#[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
 use uninstallany_macos::{
-    SystemRestoreReview, prepare_system_helper_activation, prepare_system_restore,
-    read_system_backups,
+    MacExpiryPlan as ExpiryPlan, SystemRestoreReview, prepare_system_helper_activation,
+    prepare_system_restore, read_system_backups,
 };
 use uuid::Uuid;
 
 use crate::dto::{
-    BackupInventoryPayload, ChangeReportPayload, CleanupPreview, ExpiryReviewPayload,
-    InventoryPayload, LoadedPreferencesPayload, OfficialRow, RestoreReviewPayload,
-    UninstallReviewPayload,
+    AuditExportedPayload, BackupInventoryPayload, ChangeReportPayload, CleanupPreview,
+    ExpiryReviewPayload, InventoryPayload, LoadedPreferencesPayload, OfficialRow,
+    RestoreReviewPayload, RulesSavedPayload, UninstallReviewPayload,
 };
-#[cfg(feature = "macos-privileged-helper")]
+#[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
 use crate::helper_activation::{
     HelperActivationPreviewPayload, HelperActivationReportPayload, HelperActivationTicket,
 };
@@ -43,12 +47,12 @@ struct RestoreReview {
 
 struct ExpiryReview {
     ticket: Uuid,
-    plan: MacExpiryPlan,
+    plan: ExpiryPlan,
 }
 
 enum RestoreAction {
     Local(RestorePlan),
-    #[cfg(feature = "macos-privileged-helper")]
+    #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
     System(Box<SystemRestoreReview>),
 }
 
@@ -60,9 +64,9 @@ pub(crate) struct Session<P: PlatformBackend, J> {
     cleanup: HashMap<Uuid, CleanupPlan>,
     restore: Option<RestoreReview>,
     expiry: Option<ExpiryReview>,
-    #[cfg(feature = "macos-privileged-helper")]
+    #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
     system_backup_ids: HashSet<Uuid>,
-    #[cfg(feature = "macos-privileged-helper")]
+    #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
     helper_activation: Option<HelperActivationTicket>,
 }
 
@@ -77,9 +81,9 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
             cleanup: HashMap::new(),
             restore: None,
             expiry: None,
-            #[cfg(feature = "macos-privileged-helper")]
+            #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
             system_backup_ids: HashSet::new(),
-            #[cfg(feature = "macos-privileged-helper")]
+            #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
             helper_activation: None,
         }
     }
@@ -125,8 +129,41 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
         Ok(days.get())
     }
 
+    /// Validates and saves rules for future scans.
+    pub(crate) fn set_custom_rules(
+        &mut self,
+        text: String,
+        cancel: &Cancellation,
+    ) -> Result<RulesSavedPayload> {
+        cancel.check()?;
+        let preferences = self
+            .preferences
+            .as_mut()
+            .map_err(|error| Error::Rejected(error.clone()))?;
+        let count = self.engine.persist_custom_rules(text.clone())?;
+        preferences.custom_rules = if text.trim().is_empty() {
+            String::new()
+        } else {
+            text.clone()
+        };
+        // Echo the accepted input so a whitespace-only edit is marked saved.
+        Ok(RulesSavedPayload { text, count })
+    }
+
+    /// Exports the local audit journal to a new file.
+    pub(crate) fn export_audit(
+        &self,
+        path: &Path,
+        cancel: &Cancellation,
+    ) -> Result<AuditExportedPayload> {
+        cancel.check()?;
+        self.require_preferences()?;
+        let report = self.engine.export_audit(path, cancel)?;
+        Ok(AuditExportedPayload::new(path, report))
+    }
+
     /// Previews only the helper registration needed by a selected system app.
-    #[cfg(feature = "macos-privileged-helper")]
+    #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
     pub(crate) fn review_helper_activation(
         &mut self,
         app: &AppId,
@@ -146,7 +183,7 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
     }
 
     /// Consumes the separate activation approval without running an uninstall.
-    #[cfg(feature = "macos-privileged-helper")]
+    #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
     pub(crate) fn run_helper_activation(
         &mut self,
         ticket: Uuid,
@@ -257,6 +294,55 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
         Ok(rows)
     }
 
+    /// Previews leftovers in a Windows portable directory without changing files.
+    #[cfg(windows)]
+    pub(crate) fn scan_portable(
+        &mut self,
+        path: &Path,
+        cancel: &Cancellation,
+    ) -> Result<CleanupPreview> {
+        cancel.check()?;
+        self.require_preferences()?;
+        let plan = self.engine.scan_portable(path, cancel)?;
+        let subject = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        self.replace_cleanup_preview(plan, subject, cancel)
+    }
+
+    /// Previews Windows force removal without running a vendor uninstaller.
+    #[cfg(windows)]
+    pub(crate) fn scan_force_removal(
+        &mut self,
+        app: &AppId,
+        cancel: &Cancellation,
+    ) -> Result<CleanupPreview> {
+        cancel.check()?;
+        self.require_preferences()?;
+        let plan = self.engine.force_removal(app, cancel)?;
+        self.replace_cleanup_preview(plan, None, cancel)
+    }
+
+    #[cfg(windows)]
+    fn replace_cleanup_preview(
+        &mut self,
+        plan: CleanupPlan,
+        subject: Option<String>,
+        cancel: &Cancellation,
+    ) -> Result<CleanupPreview> {
+        let preview = CleanupPreview::new(&plan, subject);
+        let has_writable = plan
+            .candidates()
+            .any(|candidate| candidate.access == Access::Allowed);
+        cancel.check()?;
+        // A successful standalone scan replaces the frontend's cleanup queue.
+        self.cleanup.clear();
+        if has_writable {
+            self.cleanup.insert(plan.id(), plan);
+        }
+        Ok(preview)
+    }
+
     /// Applies approved items and keeps a live preview when preflight can be retried.
     pub(crate) fn apply_cleanup(
         &mut self,
@@ -280,7 +366,7 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
     pub(crate) fn list_backups(&mut self, cancel: &Cancellation) -> Result<BackupInventoryPayload> {
         cancel.check()?;
         let inventory = self.engine.backups()?;
-        #[cfg(feature = "macos-privileged-helper")]
+        #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
         let inventory =
             self.merge_system_backups(inventory, read_system_backups(cancel)?.inventory);
         Ok(inventory.into())
@@ -291,11 +377,19 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
         cancel.check()?;
         self.require_preferences()?;
         self.expiry = None;
-        let plan = MacExpiryPlan::prepare(&self.engine, cancel)?;
+        #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
+        let plan = ExpiryPlan::prepare(&self.engine, cancel)?;
+        #[cfg(not(all(target_os = "macos", feature = "macos-privileged-helper")))]
+        let plan = self.engine.prepare_expiry_cleanup(cancel)?;
         cancel.check()?;
         let ticket = Uuid::new_v4();
-        let preview = ExpiryReviewPayload::new(ticket, plan.items(), plan.warnings());
-        if !plan.items().is_empty() {
+        #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
+        let entries = plan.items().iter();
+        #[cfg(not(all(target_os = "macos", feature = "macos-privileged-helper")))]
+        let entries = plan.items();
+        let has_entries = entries.len() != 0;
+        let preview = ExpiryReviewPayload::new(ticket, entries, plan.warnings());
+        if has_entries {
             self.expiry = Some(ExpiryReview { ticket, plan });
         }
         Ok(preview)
@@ -314,7 +408,12 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
             .expiry
             .take_if(|review| review.ticket == ticket)
             .ok_or_else(missing_review)?;
+        #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
         let report = review.plan.apply(&self.engine, ticket, items, cancel)?;
+        #[cfg(not(all(target_os = "macos", feature = "macos-privileged-helper")))]
+        let report = self
+            .engine
+            .apply_expiry_cleanup(review.plan.confirm(&items)?, cancel)?;
         expiry_response(report)
     }
 
@@ -326,7 +425,7 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
     ) -> Result<RestoreReviewPayload> {
         cancel.check()?;
         self.restore = None;
-        #[cfg(feature = "macos-privileged-helper")]
+        #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
         if self.system_backup_ids.contains(&batch_id) {
             return self.review_system_restore(batch_id, cancel);
         }
@@ -356,13 +455,13 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
             .ok_or_else(missing_review)?;
         match review.action {
             RestoreAction::Local(plan) => self.engine.restore(plan.confirm()?, cancel),
-            #[cfg(feature = "macos-privileged-helper")]
+            #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
             RestoreAction::System(review) => self.run_system_restore(*review, cancel),
         }
         .map(Into::into)
     }
 
-    #[cfg(feature = "macos-privileged-helper")]
+    #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
     fn merge_system_backups(
         &mut self,
         mut local: BackupInventory,
@@ -395,7 +494,7 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
         local
     }
 
-    #[cfg(feature = "macos-privileged-helper")]
+    #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
     fn review_system_restore(
         &mut self,
         operation: Uuid,
@@ -430,7 +529,7 @@ impl<P: PlatformBackend, J: Journal> Session<P, J> {
         Ok(preview)
     }
 
-    #[cfg(feature = "macos-privileged-helper")]
+    #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
     fn run_system_restore(
         &self,
         review: SystemRestoreReview,

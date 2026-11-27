@@ -255,7 +255,7 @@ fn unavailable_preferences_block_removal_while_backups_are_readable() -> Result<
         );
     }
     assert!(session.uninstall.is_none());
-    #[cfg(not(feature = "macos-privileged-helper"))]
+    #[cfg(not(all(target_os = "macos", feature = "macos-privileged-helper")))]
     session.list_backups(&cancel)?;
     session.review_restore(missing_id, &cancel)?;
     assert!(session.restore.is_none());
@@ -311,6 +311,44 @@ fn entirely_rejected_uninstall_review_preserves_the_reason_without_a_ticket() {
         Err(Error::Rejected(message)) if message.contains("application is no longer present")
     ));
     assert!(session.uninstall.is_none());
+}
+
+#[test]
+fn custom_rules_are_persisted_and_invalid_edits_leave_them_active() -> Result<()> {
+    let state = FixtureState::new(true);
+    let fixture = Fixture(&state);
+    let journal = PreferencesJournal::default();
+    let mut session = Session::new(Engine::new(fixture, &journal));
+    let cancel = Cancellation::default();
+    let text = r#"version = 1
+[[rules]]
+id = "fixture-cache"
+scope = "macos"
+app_match = { kind = "macos_bundle", id = "org.example.Fixture" }
+root_id = "macos_caches"
+relative_path = "FixtureCache"
+evidence = "Fixture application cache"
+"#;
+
+    let saved = session.set_custom_rules(text.into(), &cancel)?;
+    assert_eq!(saved.count, 1);
+    assert_eq!(saved.text, text);
+    assert!(
+        session
+            .set_custom_rules(text.replace("FixtureCache", "../FixtureCache"), &cancel)
+            .is_err()
+    );
+    assert_eq!(session.require_preferences()?.custom_rules, text);
+    let reopened = Session::new(Engine::new(fixture, &journal));
+    assert_eq!(reopened.require_preferences()?.custom_rules, text);
+
+    let cleared = session.set_custom_rules(" \n".into(), &cancel)?;
+    assert_eq!(cleared.count, 0);
+    assert_eq!(cleared.text, " \n");
+    assert!(session.require_preferences()?.custom_rules.is_empty());
+    let reopened = Session::new(Engine::new(fixture, &journal));
+    assert!(reopened.require_preferences()?.custom_rules.is_empty());
+    Ok(())
 }
 
 #[test]
@@ -383,7 +421,7 @@ fn failed_retention_save_preserves_existing_preferences_and_uninstall_review()
     Ok(())
 }
 
-#[cfg(feature = "macos-privileged-helper")]
+#[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
 #[test]
 fn an_uninstall_ticket_cannot_activate_the_system_helper() -> Result<()> {
     let state = FixtureState::new(true);
@@ -409,7 +447,7 @@ fn an_uninstall_ticket_cannot_activate_the_system_helper() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "macos-privileged-helper")]
+#[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
 #[test]
 fn system_backup_ids_cannot_be_reinterpreted_as_local_batches() {
     use uninstallany_core::{BackupInventory, BackupSummary, RecoveryState};

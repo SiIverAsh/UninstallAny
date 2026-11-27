@@ -3739,6 +3739,7 @@ dependencies = [
  "tauri-build",
  "uninstallany-core",
  "uninstallany-macos",
+ "uninstallany-windows",
  "uuid",
 ]
 
@@ -3753,6 +3754,20 @@ dependencies = [
  "sha2 0.10.9",
  "uninstallany-core",
  "uuid",
+]
+
+[[package]]
+name = "uninstallany-windows"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "uninstallany-core",
+ "uuid",
+ "windows",
+ "windows-future",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

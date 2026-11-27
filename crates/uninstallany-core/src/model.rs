@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     io,
     path::PathBuf,
     sync::{
@@ -192,6 +192,8 @@ pub struct Scan {
     pub proposals: Vec<Proposal>,
     pub warnings: Vec<String>,
     pub(crate) file_cleanup_application: Option<AppId>,
+    pub(crate) force_removal_binding: Option<String>,
+    pub(crate) post_uninstall_file_guards: HashSet<PathBuf>,
     // A present key with no fingerprint records conflicting observations.
     pub(crate) observations: HashMap<Target, Option<String>>,
 }
@@ -212,6 +214,18 @@ impl Scan {
     /// check that application when each approved file is about to be moved.
     pub fn bind_file_cleanup_application(&mut self, application: AppId) {
         self.file_cleanup_application = Some(application);
+    }
+
+    /// Binds installed force removal to native evidence observed during this scan.
+    /// Confirmation must see the same evidence and revalidate it before each write.
+    pub fn bind_force_removal(&mut self, binding: String) {
+        self.force_removal_binding = Some(binding);
+    }
+
+    /// Requires the platform to hold a guard while quarantining this exact file.
+    /// Set this on both post-uninstall scans for a file that needs late validation.
+    pub fn require_post_uninstall_file_guard(&mut self, path: PathBuf) {
+        self.post_uninstall_file_guards.insert(path);
     }
 
     /// Binds the proposal to the native fingerprint of the object used for attribution.

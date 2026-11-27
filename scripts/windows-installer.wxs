@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="B82A69F2-4229-4428-ADF3-001FBCFB2C16"
+           Name="UninstallAny" Language="1033" Version="0.1.0"
+           Manufacturer="UninstallAny"
+           UpgradeCode="B42D561D-1667-41F4-B713-146C981F8775">
+    <!-- wixl -a x64 sets the architecture in the MSI summary. -->
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
+    <Media Id="1" Cabinet="UninstallAny.cab" EmbedCab="yes" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="ApplicationFolder" Name="UninstallAny">
+          <!-- The ACL row targets this explicit CreateFolder entry. -->
+          <Component Id="ApplicationDirectory" Guid="0BD190E7-06CB-417B-8CBB-1E901C125B10" Win64="yes">
+            <CreateFolder Directory="ApplicationFolder" />
+          </Component>
+          <Component Id="DesktopComponent" Guid="70728B88-67DE-4DD9-9233-6D3A8DE11827" Win64="yes">
+            <File Id="DesktopExecutable" Name="UninstallAny.exe" Source="UninstallAny.exe"
+                  DiskId="1" KeyPath="yes" />
+          </Component>
+          <Component Id="HelperComponent" Guid="3D2218CB-D7A8-44FE-ABAC-2744975446D1" Win64="yes">
+            <File Id="PrivilegedHelper" Name="UninstallAnyHelper.exe" Source="UninstallAnyHelper.exe"
+                  DiskId="1" KeyPath="yes" />
+          </Component>
+          <Component Id="LoaderComponent" Guid="A031F347-4695-4A3A-B44D-312607B63D23" Win64="yes">
+            <File Id="WebView2Loader" Name="WebView2Loader.dll" Source="WebView2Loader.dll"
+                  DiskId="1" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Application" Title="UninstallAny" Level="1">
+      <ComponentRef Id="ApplicationDirectory" />
+      <ComponentRef Id="DesktopComponent" />
+      <ComponentRef Id="HelperComponent" />
+      <ComponentRef Id="LoaderComponent" />
+    </Feature>
+  </Product>
+</Wix>

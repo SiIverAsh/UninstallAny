@@ -3212,9 +3212,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "uninstallany-core",
  "uuid",
  "windows 0.62.2",
+ "windows-future",
  "windows-sys 0.61.2",
 ]
 

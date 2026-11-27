@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::{Error, Result, Target};
+use crate::{Cancellation, Error, Result, Target};
 
 /// An immutable local state artifact. A slot never overwrites an existing file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +83,25 @@ pub trait Journal {
     fn location(&self, id: Uuid, artifact: Artifact) -> PathBuf;
     /// Verifies that a user-selected export destination is on supported local storage.
     fn check_export_path(&self, path: &Path) -> io::Result<()>;
+
+    /// Stages and publishes a new audit file without replacing an existing name.
+    ///
+    /// The engine passes the original path after validating its syntax and
+    /// report name. The callback streams the records into the staged file.
+    /// Validate the destination before calling it and check cancellation
+    /// immediately before publishing. Platforms can bind both operations
+    /// to native directory and file handles.
+    fn write_audit_export(
+        &self,
+        path: &Path,
+        cancel: &Cancellation,
+        write: impl FnOnce(&mut dyn io::Write) -> Result<()>,
+    ) -> Result<()>
+    where
+        Self: Sized,
+    {
+        crate::audit::write_export_file(self, path, cancel, write)
+    }
 }
 
 /// One structured audit event, with sensitive native command arguments omitted.

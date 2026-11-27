@@ -114,6 +114,7 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
     ) -> Result<ExpiryCleanupStatus> {
         let plan = confirmed.0;
         self.check_session(plan.session, plan.created)?;
+        let _mutation = self.platform.begin_mutation(cancel)?;
         let mut report = ChangeReport {
             batch_id: plan.batch_id,
             items: Vec::new(),

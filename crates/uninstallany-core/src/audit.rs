@@ -1,7 +1,7 @@
 use std::{
     fs::{self, Metadata},
     io::{self, BufWriter, Write},
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
 };
 
 use serde::Serialize;
@@ -127,24 +127,14 @@ pub(crate) fn export(
     cancel: &Cancellation,
 ) -> Result<AuditExport> {
     cancel.check()?;
-    let destination = export_path(journal, destination)?;
-    match fs::symlink_metadata(&destination) {
-        Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists).into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let parent = parent_directory(&destination)?;
+    validate_export_path(destination)?;
     let mut report = AuditExport {
         written: 0,
         warnings: Vec::new(),
     };
-    let records = index(journal, cancel, &mut report.warnings)?;
-    journal.check_export_path(&destination)?;
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".uninstallany-audit-")
-        .tempfile_in(parent)?;
-    {
-        let mut writer = BufWriter::new(temporary.as_file_mut());
+    journal.write_audit_export(destination, cancel, |output| {
+        let records = index(journal, cancel, &mut report.warnings)?;
+        let mut writer = BufWriter::new(output);
         for record in records {
             cancel.check()?;
             match read_event(journal, record.artifact, record.id) {
@@ -174,14 +164,42 @@ pub(crate) fn export(
             }
         }
         writer.flush()?;
-    }
-    temporary.as_file().sync_all()?;
+        Ok(())
+    })?;
+    Ok(report)
+}
+
+pub(crate) fn write_export_file(
+    journal: &impl Journal,
+    path: &Path,
+    cancel: &Cancellation,
+    write: impl FnOnce(&mut dyn Write) -> Result<()>,
+) -> Result<()> {
     cancel.check()?;
+    let parent = parent_directory(path)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Rejected("choose a file name for the audit report".into()))?;
+    journal.check_export_path(path)?;
+    check_ancestors(parent)?;
+    let destination = fs::canonicalize(parent)?.join(name);
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists).into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     journal.check_export_path(&destination)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".uninstallany-audit-")
+        .tempfile_in(parent_directory(&destination)?)?;
+    write(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    journal.check_export_path(&destination)?;
+    cancel.check()?;
     temporary
         .persist_noclobber(destination)
         .map_err(|error| error.error)?;
-    Ok(report)
+    Ok(())
 }
 
 fn index(
@@ -312,7 +330,7 @@ fn safe_outcome<'a>(action: &str, value: &'a str) -> &'a str {
     }
 }
 
-fn export_path(journal: &impl Journal, path: &Path) -> Result<PathBuf> {
+fn validate_export_path(path: &Path) -> Result<()> {
     let ends_in_separator = path
         .as_os_str()
         .as_encoded_bytes()
@@ -367,10 +385,7 @@ fn export_path(journal: &impl Journal, path: &Path) -> Result<PathBuf> {
             "choose a report name distinct from private journal artifacts".into(),
         ));
     }
-    let parent = parent_directory(path)?;
-    journal.check_export_path(path)?;
-    check_ancestors(parent)?;
-    Ok(fs::canonicalize(parent)?.join(name))
+    Ok(())
 }
 
 fn parent_directory(path: &Path) -> Result<&Path> {

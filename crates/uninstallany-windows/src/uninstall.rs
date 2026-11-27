@@ -6,15 +6,22 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use uninstallany_core::MatchKind;
+use uninstallany_core::{Cancellation, MatchKind};
+use uuid::Uuid;
 use windows_sys::Win32::Foundation::{
-    ERROR_CANCELLED, ERROR_INSTALL_USEREXIT, ERROR_SUCCESS, ERROR_SUCCESS_REBOOT_INITIATED,
-    ERROR_SUCCESS_REBOOT_REQUIRED, ERROR_UNKNOWN_PRODUCT, HANDLE, WAIT_OBJECT_0,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_APPHELP_BLOCK, ERROR_CALL_NOT_IMPLEMENTED,
+    ERROR_CANCELLED, ERROR_ELEVATION_REQUIRED, ERROR_FILE_NOT_FOUND, ERROR_INSTALL_ALREADY_RUNNING,
+    ERROR_INSTALL_FAILURE, ERROR_INSTALL_REJECTED, ERROR_INSTALL_REMOTE_DISALLOWED,
+    ERROR_INSTALL_SUSPEND, ERROR_INSTALL_USEREXIT, ERROR_INVALID_DATA, ERROR_INVALID_FIELD,
+    ERROR_INVALID_PARAMETER, ERROR_PATCH_TARGET_NOT_FOUND, ERROR_SUCCESS,
+    ERROR_SUCCESS_REBOOT_INITIATED, ERROR_SUCCESS_REBOOT_REQUIRED, ERROR_UNKNOWN_PRODUCT,
+    GetLastError, HANDLE, SetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_GENERIC_READ, FILE_NAME_NORMALIZED, FILE_SHARE_READ, FILE_SHARE_WRITE, GetBinaryTypeW,
@@ -26,9 +33,10 @@ use windows_sys::Win32::System::ApplicationInstallationAndServicing::{
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-    QueryInformationJobObject,
+    OpenJobObjectW, QueryInformationJobObject,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
     GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
@@ -37,13 +45,18 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::{SCS_32BIT_BINARY, SCS_64BIT_BINARY};
 
-use super::files::native::{self, Identity, LocalPath, OpenPath, PathWalk};
+use super::files::WindowsFiles;
+use super::files::native::{self, DirectoryIdentity, Identity, LocalPath, OpenPath, PathWalk};
+use super::registry::{self, SystemUninstallWait, SystemUninstaller};
+use super::shortcuts::ShortcutTarget;
 
 const MAX_WINDOWS_COMMAND_UNITS: usize = 32_767;
 const MAX_UNINSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const DESCENDANT_POLL: Duration = Duration::from_millis(100);
+const PROCESS_POLL_MS: u32 = 100;
 const DESCENDANT_WAIT: Duration = Duration::from_secs(30);
+const EXIT_OBSERVATION_POLL: Duration = Duration::from_millis(500);
 const MSI_CONTEXTS: [MSIINSTALLCONTEXT; 3] = [
     MSIINSTALLCONTEXT_MACHINE,
     MSIINSTALLCONTEXT_USERMANAGED,
@@ -86,8 +99,69 @@ pub enum OfficialOutcome {
     Unverified(u32),
 }
 
+pub(super) struct NativeExecution {
+    pub outcome: OfficialOutcome,
+    pub detached: Option<PendingUninstall>,
+    pub terminal_win32_failure: Option<OfficialUninstall>,
+    pub warnings: Vec<String>,
+}
+
+pub(super) struct PendingUninstall {
+    pub process: OfficialProcess,
+    pub warning: String,
+}
+
+enum PendingReason {
+    StoppedWaiting,
+    DescendantsTimedOut,
+    DescendantsRunningAfterFailure,
+    ObservationFailed(io::Error),
+}
+
+impl PendingReason {
+    fn warning(self) -> String {
+        let reason = match self {
+            Self::StoppedWaiting => "Stopped waiting for the Windows uninstaller. It or its child processes may still be running.".into(),
+            Self::DescendantsTimedOut => "Timed out waiting for the Windows uninstaller's child processes.".into(),
+            Self::DescendantsRunningAfterFailure => "The Windows uninstaller reported a failure while its child processes were still running.".into(),
+            Self::ObservationFailed(error) => format!("Could not verify that the Windows uninstaller or its child processes exited ({error})."),
+        };
+        format!(
+            "{reason} Uninstall and cleanup are available again once the tracked processes are confirmed to have exited."
+        )
+    }
+}
+
+impl NativeExecution {
+    pub(super) fn finished(outcome: OfficialOutcome) -> Self {
+        Self {
+            outcome,
+            detached: None,
+            terminal_win32_failure: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    pub(super) fn with_warning(mut self, warning: impl Into<String>) -> Self {
+        self.warnings.push(warning.into());
+        self
+    }
+
+    fn pending(process: OfficialProcess, outcome: OfficialOutcome, reason: PendingReason) -> Self {
+        Self {
+            outcome,
+            detached: Some(PendingUninstall {
+                process,
+                warning: reason.warning(),
+            }),
+            terminal_win32_failure: None,
+            warnings: Vec::new(),
+        }
+    }
+}
+
 /// Stable executable and ancestor identities plus a digest of the file contents.
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct ExecutableIdentity {
     // A new ancestor could redirect resolution even when the leaf is unchanged.
     chain: Vec<Identity>,
@@ -107,6 +181,13 @@ enum Provider {
     Msi { product_code: String, machine: bool },
 }
 
+#[derive(Clone, Copy)]
+enum LaunchAuthority {
+    Desktop,
+    #[cfg(feature = "privileged-helper")]
+    AuthenticatedHelper,
+}
+
 /// Validated official uninstall intent. Arguments are not exposed for editing or logging.
 pub struct OfficialUninstall {
     program: PathBuf,
@@ -114,6 +195,7 @@ pub struct OfficialUninstall {
     is_quiet: bool,
     provider: Provider,
     identity: ExecutableIdentity,
+    inferred_icon: Option<(PathBuf, ExecutableIdentity)>,
 }
 
 impl OfficialUninstall {
@@ -150,14 +232,60 @@ impl OfficialUninstall {
     }
 
     /// Runs the confirmed intent on an ordinary worker thread and waits for exit.
+    #[cfg(feature = "privileged-helper")]
     pub fn execute(self) -> io::Result<OfficialOutcome> {
+        self.execute_with_authority(
+            &Cancellation::default(),
+            LaunchAuthority::AuthenticatedHelper,
+        )
+        .map(|result| result.outcome)
+    }
+
+    pub(super) fn msi_product_code(&self) -> Option<&str> {
+        match &self.provider {
+            Provider::Msi { product_code, .. } => Some(product_code),
+            Provider::Win32 { .. } => None,
+        }
+    }
+
+    fn verify_executables(&self) -> io::Result<(PinnedExecutable, Option<PinnedExecutable>)> {
         let pinned = pin_executable(&self.program)?;
         if pinned.identity()? != self.identity {
             return Err(invalid(
                 "the official uninstaller or its containing directory changed; preview again",
             ));
         }
+        let icon_pin = self
+            .inferred_icon
+            .as_ref()
+            .map(|(path, approved)| {
+                let (icon, identity) = pin_inferred_icon(&self.program, &pinned, path)?;
+                if &identity != approved {
+                    return Err(invalid(
+                        "the registered application icon executable changed; preview again",
+                    ));
+                }
+                Ok(icon)
+            })
+            .transpose()?;
+        Ok((pinned, icon_pin))
+    }
 
+    /// Checks that a reported failure still identifies the same native images.
+    pub(super) fn revalidate_failed_images(&self) -> io::Result<()> {
+        self.verify_executables().map(|_| ())
+    }
+
+    pub(super) fn execute_with_cancel(self, cancel: &Cancellation) -> io::Result<NativeExecution> {
+        self.execute_with_authority(cancel, LaunchAuthority::Desktop)
+    }
+
+    fn execute_with_authority(
+        self,
+        cancel: &Cancellation,
+        authority: LaunchAuthority,
+    ) -> io::Result<NativeExecution> {
+        let (pinned, icon_pin) = self.verify_executables()?;
         if let Provider::Msi {
             product_code,
             machine,
@@ -165,28 +293,124 @@ impl OfficialUninstall {
         {
             verify_msi_context(product_code, *machine)?;
         }
-        let process = start_process(&self, &pinned);
+        let process = start_process(&self, &pinned, cancel, authority);
         // Some uninstallers remove themselves after starting. Release the pins once
         // Windows has opened the exact executable and returned a process handle.
         drop(pinned);
-        let process = match process {
+        drop(icon_pin);
+        let mut process = match process {
             Ok(process) => process,
             Err(error) if error.raw_os_error() == Some(ERROR_CANCELLED as i32) => {
-                return Ok(OfficialOutcome::Cancelled);
+                return Ok(NativeExecution::finished(OfficialOutcome::Cancelled));
             }
             Err(error) => return Err(error),
         };
-        let code = wait_for_exit(&process.root)?;
+        if let Some(error) = process.tracking_error.take() {
+            return Ok(NativeExecution::pending(
+                process,
+                OfficialOutcome::Unverified(0),
+                PendingReason::ObservationFailed(error),
+            ));
+        }
+        // MSI can still be committing work in the installer service when the
+        // caller cancels. Only the tracked Win32 wait can be detached.
+        let wait_cancel = process.job.as_ref().map(|_| cancel);
+        let code = match wait_for_exit(&process.root, wait_cancel) {
+            Ok(Some(code)) => code,
+            Ok(None) => {
+                return Ok(NativeExecution::pending(
+                    process,
+                    OfficialOutcome::Unverified(WAIT_TIMEOUT),
+                    PendingReason::StoppedWaiting,
+                ));
+            }
+            Err(error) if process.job.is_some() => {
+                if matches!(process.is_finished(), Ok(true)) && process.clear_tracking().is_ok() {
+                    return Err(error);
+                }
+                let status = error
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok())
+                    .unwrap_or(0);
+                return Ok(NativeExecution::pending(
+                    process,
+                    OfficialOutcome::Unverified(status),
+                    PendingReason::ObservationFailed(error),
+                ));
+            }
+            Err(error) if process.msi_wait.is_some() => {
+                let status = error
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok())
+                    .unwrap_or(0);
+                return Ok(NativeExecution::finished(OfficialOutcome::Unverified(status))
+                    .with_warning(format!("Windows Installer could not be observed to completion ({error}). Restart Windows before making changes.")));
+            }
+            Err(error) => return Err(error),
+        };
 
         let Provider::Msi { product_code, .. } = &self.provider else {
-            let observed_end = code == 0 && process.job.as_ref().is_some_and(job_finished);
-            return Ok(classify_win32(code, observed_end));
+            let Some(job) = process.job.as_ref() else {
+                return Ok(NativeExecution::finished(classify_win32(code, false)));
+            };
+            let completion = if code == ERROR_SUCCESS {
+                wait_for_job(&job.handle, cancel)
+            } else {
+                // The root exit code is known, but its children may still be running.
+                match job_is_empty(&job.handle) {
+                    Ok(true) => JobCompletion::Finished,
+                    Ok(false) => {
+                        JobCompletion::Pending(PendingReason::DescendantsRunningAfterFailure)
+                    }
+                    Err(error) => JobCompletion::Pending(PendingReason::ObservationFailed(error)),
+                }
+            };
+            return Ok(match completion {
+                JobCompletion::Finished => {
+                    if let Err(error) = process.clear_tracking() {
+                        return Ok(NativeExecution::pending(
+                            process,
+                            classify_win32(code, false),
+                            PendingReason::ObservationFailed(error),
+                        ));
+                    }
+                    let mut execution = NativeExecution::finished(classify_win32(code, true));
+                    if eligible_win32_failure(code) && cancel.check().is_ok() {
+                        execution.terminal_win32_failure = Some(self);
+                    }
+                    execution
+                }
+                JobCompletion::Pending(reason) => {
+                    NativeExecution::pending(process, classify_win32(code, false), reason)
+                }
+            });
         };
         let outcome = classify_msi(code);
-        if outcome == OfficialOutcome::Completed && !msi_product_absent(product_code) {
-            return Ok(OfficialOutcome::Unverified(code));
+        if let Some(execution) = unsettled_msi_execution(outcome) {
+            // Client exit alone does not establish that the Installer service
+            // settled the operation. Keep the desktop user's pending marker.
+            return Ok(execution);
         }
-        Ok(outcome)
+        let release = process.msi_wait.take().map(SystemUninstallWait::finish);
+        let execution = if outcome == OfficialOutcome::Completed {
+            match verify_msi_product_absent(product_code) {
+                Ok(true) => NativeExecution::finished(outcome),
+                Ok(false) => NativeExecution::finished(OfficialOutcome::Unverified(code))
+                    .with_warning("Windows Installer still reports the product as registered."),
+                Err(error) => NativeExecution::finished(OfficialOutcome::Unverified(code))
+                    .with_warning(format!(
+                        "Could not verify Windows Installer product removal ({error})."
+                    )),
+            }
+        } else {
+            NativeExecution::finished(outcome)
+        };
+        if let Some(Err(error)) = release {
+            return Ok(execution.with_warning(format!(
+                "Windows Installer returned its result, but its pending record could not be cleared ({error})"
+            )));
+        }
+        Ok(execution)
     }
 }
 
@@ -203,7 +427,7 @@ pub fn prepare_win32(
             "a drive root cannot establish the ownership of an uninstaller",
         ));
     }
-    let intent = |command, is_quiet| prepare_win32_command(command, is_quiet, directory);
+    let intent = |command, is_quiet| prepare_win32_command(command, is_quiet, directory, None);
     match (quiet, interactive) {
         (Some(quiet), Some(interactive)) => match intent(quiet, true) {
             Ok(prepared) => Ok(prepared),
@@ -221,6 +445,15 @@ pub fn prepare_win32(
             "there is no official uninstall command for this application",
         )),
     }
+}
+
+/// Prepares the literal interactive action with two verified sibling executables.
+pub(super) fn prepare_inferred_win32(
+    command: &str,
+    icon: &Path,
+    directory: &Path,
+) -> io::Result<OfficialUninstall> {
+    prepare_win32_command(command, false, directory, Some(icon))
 }
 
 /// Prepares removal for one installed MSI ProductCode in its verified registry scope.
@@ -243,6 +476,7 @@ pub fn prepare_msi(
             machine,
         },
         identity: pinned.identity()?,
+        inferred_icon: None,
     })
 }
 
@@ -250,23 +484,28 @@ fn prepare_win32_command(
     command: &str,
     is_quiet: bool,
     directory: &Path,
+    icon: Option<&Path>,
 ) -> io::Result<OfficialUninstall> {
     let (program, arguments) = split_command(command)?;
+    if icon.is_some() && !arguments.is_empty() {
+        return Err(invalid(
+            "an uninstall command without a declared directory cannot have arguments",
+        ));
+    }
     let program = PathBuf::from(program);
-    let stem = program
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| invalid("the uninstaller has no valid executable name"))?;
-    if BLOCKED_EXECUTABLES
-        .iter()
-        .any(|name| stem.eq_ignore_ascii_case(name))
-    {
+    if is_system_command_wrapper(&program) {
         return Err(invalid(
             "the registered uninstall command uses a shell or a system command wrapper",
         ));
     }
 
     let pinned = pin_executable_in_directory(&program, directory)?;
+    let inferred_icon = icon
+        .map(|path| {
+            let (_pin, identity) = pin_inferred_icon(&program, &pinned, path)?;
+            Ok::<_, io::Error>((path.to_path_buf(), identity))
+        })
+        .transpose()?;
     Ok(OfficialUninstall {
         program,
         arguments: arguments.to_owned(),
@@ -275,16 +514,128 @@ fn prepare_win32_command(
             quiet_rejected: false,
         },
         identity: pinned.identity()?,
+        inferred_icon,
     })
 }
 
-/// Directory scope for read-only references from Windows registrations.
+pub(super) fn is_system_command_wrapper(path: &Path) -> bool {
+    path.file_stem().and_then(OsStr::to_str).is_none_or(|stem| {
+        BLOCKED_EXECUTABLES
+            .iter()
+            .any(|name| stem.eq_ignore_ascii_case(name))
+    })
+}
+
+fn pin_inferred_icon(
+    program: &Path,
+    uninstaller: &PinnedExecutable,
+    icon_path: &Path,
+) -> io::Result<(PinnedExecutable, ExecutableIdentity)> {
+    uninstaller
+        .path
+        .verify_address_under(&LocalPath::parse(program)?)?;
+    native::regular(uninstaller.path.leaf())?;
+    let (icon, identity) = pin_startup_executable(icon_path)?;
+    let Some(((program_id, program_parent), (icon_id, icon_parent))) =
+        uninstaller.chain.split_last().zip(icon.chain.split_last())
+    else {
+        return Err(invalid("could not verify the two executable paths"));
+    };
+    if program_parent != icon_parent || program_id == icon_id {
+        return Err(invalid(
+            "the icon and uninstaller must be distinct executables in the same directory",
+        ));
+    }
+    Ok((icon, identity))
+}
+
+/// No-follow directory identity captured before the native uninstall starts.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct FormerInstallation {
+    anchor_depth: usize,
+    directories: Vec<DirectoryIdentity>,
+}
+
+impl FormerInstallation {
+    pub(super) fn capture(directory: &Path, trusted_root: &Path) -> io::Result<Self> {
+        let location = LocalPath::parse(directory)?;
+        let anchor_depth = former_anchor_depth(&location, trusted_root)?;
+        let opened = native::open(&location, 0, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+        opened.verify_address_under(&location)?;
+        let directories = opened
+            .handles()
+            .iter()
+            .map(native::directory_identity)
+            .collect::<io::Result<_>>()?;
+        Ok(Self {
+            anchor_depth,
+            directories,
+        })
+    }
+
+    pub(super) fn verify(&self, directory: &Path) -> io::Result<()> {
+        self.reopen(&LocalPath::parse(directory)?).map(|_| ())
+    }
+
+    fn reopen(&self, location: &LocalPath) -> io::Result<PathWalk> {
+        if self.directories.len() != location.depth() + 1
+            || self.anchor_depth == 0
+            || self.anchor_depth >= location.depth()
+        {
+            return Err(invalid(
+                "installation observation does not match the authorized path",
+            ));
+        }
+        let walked = native::walk(location, 0, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+        match &walked {
+            PathWalk::Present(directory)
+            | PathWalk::Missing {
+                parent: directory, ..
+            } => {
+                directory.verify_address_under(location)?;
+                self.verify_prefix(directory)?;
+            }
+        }
+        Ok(walked)
+    }
+
+    fn verify_prefix(&self, opened: &OpenPath) -> io::Result<()> {
+        if opened.handles().len() <= self.anchor_depth {
+            return Err(invalid(
+                "could not reach the originally verified installation root",
+            ));
+        }
+        // When the uninstaller removed the folder, only the surviving prefix
+        // must match. A same-path replacement is not evidence of absence.
+        for (handle, expected) in opened.handles().iter().zip(&self.directories) {
+            if native::directory_identity(handle)? != *expected {
+                return Err(invalid(
+                    "the original installation directory or one of its ancestors was replaced",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn former_anchor_depth(location: &LocalPath, trusted_root: &Path) -> io::Result<usize> {
+    let anchor = LocalPath::parse(trusted_root)?;
+    let depth = anchor.depth();
+    if depth == 0 || location.depth() <= depth || !location.starts_with(&anchor) {
+        return Err(invalid(
+            "the former installation is outside the trusted root",
+        ));
+    }
+    Ok(depth)
+}
+
+/// Directory scope for references from Windows registrations.
 pub(super) struct RegisteredScope {
     location: LocalPath,
     location_id: Option<Identity>,
     anchor_depth: usize,
     anchor_id: Identity,
-    former_location: Option<PathBuf>,
+    former: Option<(PathBuf, FormerInstallation)>,
 }
 
 impl RegisteredScope {
@@ -304,48 +655,45 @@ impl RegisteredScope {
             location_id: Some(anchor_id.clone()),
             anchor_depth,
             anchor_id,
-            former_location: None,
+            former: None,
         })
     }
 
     /// Allows missing paths below the former install location after verified uninstall.
-    pub(super) fn after_uninstall(directory: &Path, trusted_root: &Path) -> io::Result<Self> {
+    pub(super) fn after_uninstall(
+        directory: &Path,
+        trusted_root: &Path,
+        observed: &FormerInstallation,
+    ) -> io::Result<Self> {
         let location = LocalPath::parse(directory)?;
-        let anchor = LocalPath::parse(trusted_root)?;
-        let anchor_depth = anchor.depth();
-        if anchor_depth == 0 || location.depth() <= anchor_depth || !location.starts_with(&anchor) {
+        let anchor_depth = former_anchor_depth(&location, trusted_root)?;
+        if observed.anchor_depth != anchor_depth {
             return Err(invalid(
-                "the former installation is outside the trusted root",
+                "the trusted installation root changed after uninstall",
             ));
         }
-        let root = native::open(&anchor, 0, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
-        native::require_directory(root.leaf())?;
-        root.verify_address_under(&anchor)?;
-        let anchor_id = native::identity(root.leaf())?;
-        let location_id = match native::walk(&location, 0, FILE_SHARE_READ | FILE_SHARE_WRITE)? {
+        let (opened, location_id) = match observed.reopen(&location)? {
             PathWalk::Present(directory) => {
-                verify_registration_anchor(&directory, anchor_depth, &anchor_id)?;
-                native::require_directory(directory.leaf())?;
-                directory.verify_address_under(&location)?;
-                Some(native::identity(directory.leaf())?)
+                let id = native::identity(directory.leaf())?;
+                (directory, Some(id))
             }
-            PathWalk::Missing { parent, .. } => {
-                verify_registration_anchor(&parent, anchor_depth, &anchor_id)?;
-                parent.verify_address_under(&location)?;
-                None
-            }
+            PathWalk::Missing { parent, .. } => (parent, None),
         };
+        let anchor_id = native::identity(&opened.handles()[anchor_depth])?;
         Ok(Self {
             location,
             location_id,
             anchor_depth,
             anchor_id,
-            former_location: Some(directory.to_path_buf()),
+            former: Some((directory.to_path_buf(), observed.clone())),
         })
     }
 
     fn verify_ancestors(&self, path: &OpenPath, requested: &LocalPath) -> io::Result<()> {
         verify_registration_anchor(path, self.anchor_depth, &self.anchor_id)?;
+        if let Some((_, proof)) = &self.former {
+            proof.verify_prefix(path)?;
+        }
         let observed = path
             .handles()
             .get(self.location.depth())
@@ -357,6 +705,123 @@ impl RegisteredScope {
             ));
         }
         path.verify_address_under(requested)
+    }
+
+    /// Reports whether this scope was verified after official uninstall.
+    pub(super) fn is_former_installation(&self) -> bool {
+        self.former.is_some()
+    }
+
+    /// Proves that a literal uninstaller is missing below the verified directory.
+    pub(super) fn missing_uninstaller(&self, program: &Path) -> io::Result<bool> {
+        let Some(child) = registration_child(program, &self.location, "exe") else {
+            return Ok(false);
+        };
+        match native::walk(&child, 0, FILE_SHARE_READ | FILE_SHARE_WRITE)? {
+            PathWalk::Present(_) => Ok(false),
+            PathWalk::Missing { parent, .. } => {
+                self.verify_ancestors(&parent, &child)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Checks whether a literal uninstaller path is inside the approved directory.
+    pub(super) fn contains_uninstaller(&self, program: &Path) -> bool {
+        registration_child(program, &self.location, "exe").is_some()
+    }
+
+    /// Identifies an executable in the verified installation scope.
+    pub(super) fn executable_identity(
+        &self,
+        program: &Path,
+    ) -> io::Result<Option<ExecutableIdentity>> {
+        let Some(child) = registration_child(program, &self.location, "exe") else {
+            return Ok(None);
+        };
+        let pinned = pin_executable(program)?;
+        self.verify_ancestors(&pinned.path, &child)?;
+        native::regular(pinned.path.leaf())?;
+        pinned.identity().map(Some)
+    }
+
+    /// Attributes a startup shortcut's exact executable within this installation.
+    pub(super) fn startup_shortcut_identity(
+        &self,
+        target: &ShortcutTarget,
+    ) -> io::Result<Option<ExecutableIdentity>> {
+        let Some(child) = registration_child(&target.path, &self.location, "exe") else {
+            return Ok(None);
+        };
+        let (pinned, identity) = pin_startup_shortcut_target(target)?;
+        self.verify_ancestors(&pinned.path, &child)?;
+        Ok(Some(identity))
+    }
+
+    /// Observes a literal shortcut's local executable within this installation.
+    pub(super) fn observe_direct_shortcut_executable(
+        &self,
+        target: &ShortcutTarget,
+        bytes_remaining: &mut u64,
+    ) -> io::Result<Option<ExecutableIdentity>> {
+        if !target.direct || is_system_command_wrapper(&target.path) || *bytes_remaining == 0 {
+            return Ok(None);
+        }
+        let Some(child) = registration_child(&target.path, &self.location, "exe") else {
+            return Ok(None);
+        };
+        let PathWalk::Present(path) = native::walk(&child, FILE_GENERIC_READ, FILE_SHARE_READ)?
+        else {
+            return Ok(None);
+        };
+        self.verify_ancestors(&path, &child)?;
+        let leaf = path.leaf();
+        // Ordinary shortcuts can name files that the scanner must not recall
+        // or consult by path for a PE check.
+        if !native::metadata(leaf)?.is_single_local_file()
+            || native::volume_serial(leaf)? != target.volume_serial
+        {
+            return Ok(None);
+        }
+        let size = File::from(leaf.try_clone()?).metadata()?.len();
+        if size > (*bytes_remaining).min(MAX_UNINSTALLER_BYTES) {
+            return Ok(None);
+        }
+        // Reserve the file's size even if inspection fails partway through.
+        *bytes_remaining -= size;
+        pin_open_executable(path)?.identity().map(Some)
+    }
+
+    /// Holds the last present parent of a verified former shortcut executable.
+    pub(super) fn pin_missing_shortcut_executable(
+        &self,
+        target: &ShortcutTarget,
+        original: &ExecutableIdentity,
+    ) -> io::Result<Option<OpenPath>> {
+        if self.former.is_none() || !target.direct || is_system_command_wrapper(&target.path) {
+            return Ok(None);
+        }
+        let Some(child) = registration_child(&target.path, &self.location, "exe") else {
+            return Ok(None);
+        };
+        if original.chain.len() != child.depth() + 1 {
+            return Ok(None);
+        }
+        let PathWalk::Missing { parent, .. } = native::walk(&child, 0, FILE_SHARE_READ)? else {
+            return Ok(None);
+        };
+        self.verify_ancestors(&parent, &child)?;
+        if native::volume_serial(parent.leaf())? != target.volume_serial {
+            return Ok(None);
+        }
+        // A missing leaf inside a replaced intermediate directory does not
+        // establish absence under the original executable's parent chain.
+        for (handle, expected) in parent.handles().iter().zip(&original.chain) {
+            if native::identity(handle)? != *expected {
+                return Ok(None);
+            }
+        }
+        Ok(Some(parent))
     }
 }
 
@@ -378,7 +843,7 @@ fn verify_registration_anchor(
     Ok(())
 }
 
-/// Attribution for a verified present file or an absent, read-only registration target.
+/// Attribution for a verified present file or a missing file under a former installation.
 pub(super) struct RegisteredReference {
     pub(super) path: PathBuf,
     pub(super) evidence: MatchKind,
@@ -418,7 +883,7 @@ pub(super) fn registered_image(
     resolve_registration(program, scope, RegistrationFile::Executable(None))
 }
 
-/// Matches an existing executable only on the volume recorded by the Shell Link.
+/// Matches a shortcut's executable or verified former directory on the recorded volume.
 pub(super) fn registered_shortcut_image(
     program: &Path,
     scope: &RegisteredScope,
@@ -471,11 +936,17 @@ fn resolve_registration(
             (MatchKind::ExactIdentity, None)
         }
         PathWalk::Missing { parent, .. } => {
-            if scope.former_location.is_none() {
+            let Some((directory, _)) = &scope.former else {
                 return Ok(None);
-            }
+            };
             scope.verify_ancestors(&parent, &child)?;
-            (MatchKind::AppName, scope.former_location.clone())
+            if let RegistrationFile::Executable(Some(serial)) = kind {
+                // With no executable handle, the last pinned ancestor verifies the volume.
+                if native::volume_serial(parent.leaf())? != serial {
+                    return Ok(None);
+                }
+            }
+            (MatchKind::AppName, Some(directory.clone()))
         }
     };
     Ok(Some(RegisteredReference {
@@ -520,7 +991,7 @@ fn pin_executable_in_directory(program: &Path, directory: &Path) -> io::Result<P
     Ok(pinned)
 }
 
-fn split_command(command: &str) -> io::Result<(&str, &str)> {
+pub(super) fn split_command(command: &str) -> io::Result<(&str, &str)> {
     if command.encode_utf16().count() >= MAX_WINDOWS_COMMAND_UNITS
         || command.chars().any(|ch| ch.is_control() && ch != '\t')
     {
@@ -555,16 +1026,42 @@ fn split_command(command: &str) -> io::Result<(&str, &str)> {
     Ok((program, arguments.trim_start_matches([' ', '\t'])))
 }
 
+pub(super) fn display_icon_path(value: &str) -> Option<&Path> {
+    let path = match value.rsplit_once(',') {
+        Some((path, index)) => {
+            index.trim().parse::<i32>().ok()?;
+            path.trim()
+        }
+        None => value.trim(),
+    };
+    let path = match path.strip_prefix('"') {
+        Some(quoted) => quoted.strip_suffix('"')?,
+        None => path,
+    };
+    if path.ends_with(['\\', '/'])
+        || path.contains(['%', '"', ','])
+        || path.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let path = Path::new(path);
+    LocalPath::parse(path).ok()?;
+    Some(path)
+}
+
 fn pin_executable(path: &Path) -> io::Result<PinnedExecutable> {
     let path = native::open(&LocalPath::parse(path)?, FILE_GENERIC_READ, FILE_SHARE_READ)?;
-    let leaf = path.leaf();
-    let metadata = native::metadata(leaf)?;
+    let metadata = native::metadata(path.leaf())?;
     if metadata.is_directory || metadata.is_reparse {
         return Err(invalid(
             "the uninstaller is not an ordinary executable file",
         ));
     }
-    let native_name = final_name(leaf)?;
+    pin_open_executable(path)
+}
+
+fn pin_open_executable(path: OpenPath) -> io::Result<PinnedExecutable> {
+    let native_name = final_name(path.leaf())?;
     require_binary_type(&native_name)?;
     Ok(PinnedExecutable {
         chain: path
@@ -586,6 +1083,24 @@ pub(super) fn pin_startup_executable(
     pinned.path.verify_address_under(&requested)?;
     native::regular(pinned.path.leaf())?;
     let identity = pinned.identity()?;
+    Ok((pinned, identity))
+}
+
+/// Pins the exact native binary and checks the volume stored by the link.
+pub(super) fn pin_startup_shortcut_target(
+    target: &ShortcutTarget,
+) -> io::Result<(PinnedExecutable, ExecutableIdentity)> {
+    if is_system_command_wrapper(&target.path) {
+        return Err(invalid(
+            "the startup shortcut uses a system command wrapper",
+        ));
+    }
+    let (pinned, identity) = pin_startup_executable(&target.path)?;
+    if native::volume_serial(pinned.path.leaf())? != target.volume_serial {
+        return Err(invalid(
+            "the startup executable is on a different volume than the shortcut recorded",
+        ));
+    }
     Ok((pinned, identity))
 }
 
@@ -682,6 +1197,8 @@ fn final_name(file: &OwnedHandle) -> io::Result<Vec<u16>> {
 fn start_process(
     intent: &OfficialUninstall,
     executable: &PinnedExecutable,
+    cancel: &Cancellation,
+    authority: LaunchAuthority,
 ) -> io::Result<OfficialProcess> {
     let mut command_line = format!("\"{}\"", intent.program.display());
     if !intent.arguments.is_empty() {
@@ -699,7 +1216,10 @@ fn start_process(
         Provider::Win32 { .. } => Some(create_tracking_job()?),
         Provider::Msi { .. } => None,
     };
-    let mut attributes = job.as_ref().map(JobAttributes::new).transpose()?;
+    let mut attributes = job
+        .as_ref()
+        .map(|job| JobAttributes::new(&job.handle))
+        .transpose()?;
     let mut startup = STARTUPINFOEXW::default();
     let creation_flags = if let Some(attributes) = attributes.as_mut() {
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -711,6 +1231,28 @@ fn start_process(
     };
     let mut process = PROCESS_INFORMATION::default();
     executable.recheck_handles()?;
+    if cancel.check().is_err() {
+        return Err(io::Error::from_raw_os_error(ERROR_CANCELLED as i32));
+    }
+    let mut msi_wait = None;
+    if let Some(job) = &job {
+        // Reserve the launch before asking Windows to admit any process. A
+        // vanished launcher alone does not establish the Job was never used.
+        registry::begin_win32_launch(job.id)?;
+    } else if matches!(authority, LaunchAuthority::Desktop) {
+        // The authenticated helper is tracked by the desktop that sent its
+        // request. In an alternate administrator account it has a different hive.
+        msi_wait = Some(SystemUninstallWait::begin(SystemUninstaller::DirectMsi)?);
+    }
+    if cancel.check().is_err() {
+        if let Some(job) = &job {
+            registry::clear_win32_launch(job.id)?;
+        }
+        if let Some(wait) = msi_wait {
+            wait.finish()?;
+        }
+        return Err(io::Error::from_raw_os_error(ERROR_CANCELLED as i32));
+    }
     // SAFETY: pointers are valid for the call, including the mutable NUL-terminated
     // command line and job attribute storage. The executable path comes from the
     // pinned file handle. StartupInfo is the first field of STARTUPINFOEXW.
@@ -729,7 +1271,20 @@ fn start_process(
         )
     };
     if started == 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        if let Some(job) = &job {
+            if !job_is_empty(&job.handle)? {
+                return Err(io::Error::other(
+                    "Windows did not confirm process creation, but the uninstall job is active",
+                ));
+            }
+            registry::clear_win32_launch(job.id)?;
+        }
+        if let Some(wait) = msi_wait {
+            // No client process was created to deliver the installer request.
+            wait.finish()?;
+        }
+        return Err(error);
     }
     // SAFETY: the successful call owns two new handles. Only the process handle
     // must outlive this function, so the primary-thread handle is closed here.
@@ -737,23 +1292,182 @@ fn start_process(
     drop(thread);
     // SAFETY: ownership of the valid process handle is transferred exactly once.
     let root = unsafe { OwnedHandle::from_raw_handle(process.hProcess) };
-    Ok(OfficialProcess { root, job })
+    let tracking_error = job
+        .as_ref()
+        .and_then(|job| registry::commit_win32_launch(job.id).err());
+    Ok(OfficialProcess {
+        root,
+        job,
+        tracking_error,
+        msi_wait,
+    })
 }
 
-struct OfficialProcess {
+pub(super) struct OfficialProcess {
     root: OwnedHandle,
-    job: Option<OwnedHandle>,
+    job: Option<TrackedJob>,
+    tracking_error: Option<io::Error>,
+    msi_wait: Option<SystemUninstallWait>,
 }
 
-fn create_tracking_job() -> io::Result<OwnedHandle> {
-    // SAFETY: null inputs create an unnamed job with default security and limits.
-    // There is no kill-on-close limit, so closing this observer never stops a job.
-    let job = unsafe { CreateJobObjectW(null(), null()) };
+pub(super) fn local_pending_uninstall() -> io::Result<MutexGuard<'static, Option<OfficialProcess>>>
+{
+    static PENDING: Mutex<Option<OfficialProcess>> = Mutex::new(None);
+    PENDING
+        .lock()
+        .map_err(|_| io::Error::other("could not access the Windows uninstaller observation"))
+}
+
+/// Retains the desktop's last detached uninstall after the windows have closed.
+pub struct ExitObservation {
+    process: OfficialProcess,
+    id: Uuid,
+}
+
+/// Captures only a job this desktop launched, before event-loop teardown.
+pub fn capture_exit_observation() -> io::Result<Option<ExitObservation>> {
+    let pending = local_pending_uninstall()?;
+    let Some((process, job)) = pending
+        .as_ref()
+        .and_then(|process| process.job.as_ref().map(|job| (process, job)))
+    else {
+        return Ok(None);
+    };
+    let id = job.id;
+    Ok(Some(ExitObservation {
+        process: OfficialProcess {
+            root: process.root.try_clone()?,
+            job: Some(TrackedJob {
+                id,
+                handle: job.handle.try_clone()?,
+            }),
+            tracking_error: None,
+            msi_wait: None,
+        },
+        id,
+    }))
+}
+
+impl ExitObservation {
+    /// Waits without an open window. Never terminates the publisher's processes.
+    pub fn finish(self) -> io::Result<()> {
+        while !self.process.is_finished()? {
+            thread::sleep(EXIT_OBSERVATION_POLL);
+        }
+        let files = WindowsFiles::new()?;
+        loop {
+            if registry::pending_win32_launch()?.map(|(id, _)| id) != Some(self.id) {
+                return Ok(());
+            }
+            match files.lock_mutations() {
+                Ok(_lock) => {
+                    // A replacement desktop can also clear a finished Job.
+                    // Never remove a newer launch marker after waiting for its lock.
+                    if registry::pending_win32_launch()?.map(|(id, _)| id) == Some(self.id) {
+                        registry::clear_win32_launch(self.id)?;
+                    }
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(EXIT_OBSERVATION_POLL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl OfficialProcess {
+    pub(super) fn is_finished(&self) -> io::Result<bool> {
+        if !process_finished_in(&self.root, 0)? {
+            return Ok(false);
+        }
+        match &self.job {
+            Some(job) => job_is_empty(&job.handle),
+            None => Ok(true),
+        }
+    }
+
+    /// Returns the identity used to match this handle to the recorded launch.
+    pub(super) fn job_id(&self) -> Option<Uuid> {
+        self.job.as_ref().map(|job| job.id)
+    }
+
+    fn clear_tracking(&self) -> io::Result<()> {
+        if let Some(id) = self.job_id() {
+            registry::clear_win32_launch(id)?;
+        }
+        Ok(())
+    }
+}
+
+struct TrackedJob {
+    id: Uuid,
+    handle: OwnedHandle,
+}
+
+fn tracking_job_name(id: Uuid) -> Vec<u16> {
+    wide(OsStr::new(&format!(r"Global\UninstallAny.Win32.{id}")))
+}
+
+fn create_tracking_job() -> io::Result<TrackedJob> {
+    let id = Uuid::new_v4();
+    let name = tracking_job_name(id);
+    // SAFETY: the name is terminated, and default attributes create a
+    // non-inheritable handle secured by the caller's token. No kill-on-close.
+    let (job, status) = unsafe {
+        SetLastError(ERROR_SUCCESS);
+        let job = CreateJobObjectW(null(), name.as_ptr());
+        (job, GetLastError())
+    };
     if job.is_null() {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::from_raw_os_error(status as i32));
     }
     // SAFETY: the API returned a new owned job handle on success.
-    Ok(unsafe { OwnedHandle::from_raw_handle(job) })
+    let handle = unsafe { OwnedHandle::from_raw_handle(job) };
+    if status == ERROR_ALREADY_EXISTS {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "the Windows uninstall job name is already in use",
+        ));
+    }
+    Ok(TrackedJob { id, handle })
+}
+
+/// Establishes completion from an extant Job after an observed successful dispatch.
+pub(super) fn require_finished_win32_job(id: Uuid, committed: bool) -> io::Result<()> {
+    let unavailable = || {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the previous Win32 uninstall cannot be verified. If the original UninstallAny window is closed, restart Windows before making changes",
+        )
+    };
+    if !committed {
+        return Err(unavailable());
+    }
+    let name = tracking_job_name(id);
+    // SAFETY: the terminated name is valid. The handle can only query the Job.
+    let handle = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr()) };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        return Err(
+            if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                // Windows can remove the name while member processes are still alive.
+                unavailable()
+            } else {
+                error
+            },
+        );
+    }
+    // SAFETY: the query handle was returned by a successful open.
+    let job = unsafe { OwnedHandle::from_raw_handle(handle) };
+    if !job_is_empty(&job)? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the previous Windows uninstaller is still running",
+        ));
+    }
+    Ok(())
 }
 
 struct JobAttributes {
@@ -812,45 +1526,85 @@ impl Drop for JobAttributes {
     }
 }
 
-fn job_finished(job: &OwnedHandle) -> bool {
+enum JobCompletion {
+    Finished,
+    Pending(PendingReason),
+}
+
+fn wait_for_job(job: &OwnedHandle, cancel: &Cancellation) -> JobCompletion {
     let start = Instant::now();
     loop {
-        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: job is an open job handle, and info matches the accounting class.
-        let ok = unsafe {
-            QueryInformationJobObject(
-                job.as_raw_handle(),
-                JobObjectBasicAccountingInformation,
-                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                null_mut(),
-            )
-        };
-        if ok == 0 {
-            return false;
+        match job_is_empty(job) {
+            Ok(true) => return JobCompletion::Finished,
+            Ok(false) => {}
+            Err(error) => return JobCompletion::Pending(PendingReason::ObservationFailed(error)),
         }
-        if info.ActiveProcesses == 0 {
-            return true;
+        if cancel.check().is_err() {
+            return JobCompletion::Pending(PendingReason::StoppedWaiting);
         }
         if start.elapsed() >= DESCENDANT_WAIT {
-            return false;
+            return JobCompletion::Pending(PendingReason::DescendantsTimedOut);
         }
         // Closing the job leaves any externally managed or long-running child alone.
         thread::sleep(DESCENDANT_POLL);
     }
 }
 
-fn wait_for_exit(process: &OwnedHandle) -> io::Result<u32> {
-    // SAFETY: process owns a live process handle allowed for waiting.
-    if unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } != WAIT_OBJECT_0 {
+fn job_is_empty(job: &OwnedHandle) -> io::Result<bool> {
+    let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    // SAFETY: job is an open job handle, and info matches the accounting class.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectBasicAccountingInformation,
+            (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
         return Err(io::Error::last_os_error());
+    }
+    Ok(info.ActiveProcesses == 0)
+}
+
+fn wait_for_exit(process: &OwnedHandle, cancel: Option<&Cancellation>) -> io::Result<Option<u32>> {
+    if !wait_for_signal(process, cancel)? {
+        return Ok(None);
     }
     let mut code = 0;
     // SAFETY: process remains alive as a handle and code is writable.
     if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(code)
+    Ok(Some(code))
+}
+
+fn wait_for_signal(process: &OwnedHandle, cancel: Option<&Cancellation>) -> io::Result<bool> {
+    loop {
+        // Always probe once more after cancellation, so an observed exit remains real.
+        let timeout = match cancel {
+            Some(cancel) if cancel.check().is_err() => 0,
+            Some(_) => PROCESS_POLL_MS,
+            None => INFINITE,
+        };
+        if process_finished_in(process, timeout)? {
+            return Ok(true);
+        }
+        if timeout == 0 {
+            return Ok(false);
+        }
+    }
+}
+
+fn process_finished_in(process: &OwnedHandle, timeout: u32) -> io::Result<bool> {
+    // SAFETY: process owns a live process handle with SYNCHRONIZE access.
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), timeout) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        _ => Err(invalid("unexpected Windows process wait status")),
+    }
 }
 
 pub(super) fn normalize_product_code(code: &str) -> io::Result<String> {
@@ -894,10 +1648,14 @@ pub(super) fn verify_msi_context(product: &str, machine: bool) -> io::Result<()>
     }
 }
 
-fn msi_product_absent(product: &str) -> bool {
-    MSI_CONTEXTS
-        .into_iter()
-        .all(|context| matches!(msi_product_state(product, context), Ok(None)))
+/// Verifies machine and both current-user registration contexts for the exact product.
+pub(super) fn verify_msi_product_absent(product: &str) -> io::Result<bool> {
+    for context in MSI_CONTEXTS {
+        if msi_product_state(product, context)?.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn msi_product_state(product: &str, context: MSIINSTALLCONTEXT) -> io::Result<Option<bool>> {
@@ -951,8 +1709,53 @@ fn classify_msi(code: u32) -> OfficialOutcome {
             OfficialOutcome::NeedsRestart
         }
         ERROR_INSTALL_USEREXIT | ERROR_CANCELLED => OfficialOutcome::Cancelled,
-        _ => OfficialOutcome::Failed(code),
+        _ if confirmed_msi_failure(code) => OfficialOutcome::Failed(code),
+        _ => OfficialOutcome::Unverified(code),
     }
+}
+
+fn confirmed_msi_failure(code: u32) -> bool {
+    // MsiExec returns raw Win32 codes. Accept the documented terminal errors
+    // and specific failed-launch codes without treating arbitrary DWORDs or
+    // an HRESULT's low word as confirmation that the service ended the work.
+    matches!(
+        code,
+        ERROR_ACCESS_DENIED
+            | ERROR_ELEVATION_REQUIRED
+            | ERROR_INVALID_DATA
+            | ERROR_INVALID_PARAMETER
+            | ERROR_CALL_NOT_IMPLEMENTED
+            | ERROR_APPHELP_BLOCK
+            | ERROR_INSTALL_FAILURE
+            | ERROR_UNKNOWN_PRODUCT..=ERROR_INVALID_FIELD
+            | ERROR_INSTALL_ALREADY_RUNNING..=ERROR_INSTALL_REMOTE_DISALLOWED
+            | ERROR_PATCH_TARGET_NOT_FOUND..=ERROR_INSTALL_REJECTED
+    )
+}
+
+/// Interprets results from the current MSI client and older authenticated helpers.
+pub(super) fn unsettled_msi_execution(outcome: OfficialOutcome) -> Option<NativeExecution> {
+    let (outcome, warning) = match outcome {
+        OfficialOutcome::NeedsRestart => (
+            outcome,
+            "Windows Installer reported a restart. Changes remain blocked until Windows restarts.".into(),
+        ),
+        OfficialOutcome::Failed(ERROR_INSTALL_SUSPEND)
+        | OfficialOutcome::Unverified(ERROR_INSTALL_SUSPEND) => (
+            OfficialOutcome::Unverified(ERROR_INSTALL_SUSPEND),
+            "Windows Installer suspended the operation (1604). Changes remain blocked. Restart Windows and let Windows Installer finish or roll back its work before continuing.".into(),
+        ),
+        OfficialOutcome::Completed
+        | OfficialOutcome::Cancelled
+        | OfficialOutcome::Unverified(ERROR_SUCCESS) => return None,
+        OfficialOutcome::Failed(code) if confirmed_msi_failure(code) => return None,
+        // Old helpers used Failed for any raw client exit they didn't recognize.
+        OfficialOutcome::Unverified(code) | OfficialOutcome::Failed(code) => (
+            OfficialOutcome::Unverified(code),
+            format!("Windows Installer did not report a known completion status ({code:#010x}). Changes remain blocked until Windows restarts."),
+        ),
+    };
+    Some(NativeExecution::finished(outcome).with_warning(warning))
 }
 
 fn classify_win32(code: u32, observed_end: bool) -> OfficialOutcome {
@@ -962,6 +1765,21 @@ fn classify_win32(code: u32, observed_end: bool) -> OfficialOutcome {
         (0, false) => OfficialOutcome::Unverified(code),
         _ => OfficialOutcome::Failed(code),
     }
+}
+
+fn eligible_win32_failure(code: u32) -> bool {
+    !matches!(
+        code,
+        ERROR_SUCCESS
+            | ERROR_CANCELLED
+            | ERROR_INSTALL_USEREXIT
+            | ERROR_INSTALL_SUSPEND
+            | ERROR_INSTALL_ALREADY_RUNNING
+            | ERROR_SUCCESS_REBOOT_INITIATED
+            | ERROR_SUCCESS_REBOOT_REQUIRED
+            | ERROR_ACCESS_DENIED
+            | ERROR_ELEVATION_REQUIRED
+    )
 }
 
 fn wide(input: &OsStr) -> Vec<u16> {
@@ -1015,11 +1833,71 @@ mod tests {
     }
 
     #[test]
+    fn display_icon_path_accepts_a_literal_path_and_optional_index() {
+        let executable = r"C:\Users\Sam\Apps\Example Editor\editor.exe";
+        assert_eq!(display_icon_path(executable), Some(Path::new(executable)));
+        assert_eq!(
+            display_icon_path(&format!(r#""{executable}",0"#)),
+            Some(Path::new(executable))
+        );
+        for invalid in [
+            r"%TEMP%\editor.exe,0",
+            r"C:\Apps\..\editor.exe,0",
+            r"C:\Apps\editor.exe,argument",
+            r"C:\Apps\editor.exe\",
+        ] {
+            assert!(display_icon_path(invalid).is_none(), "{invalid}");
+        }
+    }
+
+    #[test]
+    #[ignore = "run on a disposable Windows VM with fixed NTFS storage"]
+    fn missing_shortcut_target_requires_the_recorded_volume() -> io::Result<()> {
+        let files = crate::files::WindowsFiles::new()?;
+        let root = tempfile::tempdir_in(files.local_app_data())?;
+        let former = root.path().join("Example Editor");
+        let program = former.join("editor.exe");
+        std::fs::create_dir(&former)?;
+        let observed = FormerInstallation::capture(&former, root.path())?;
+        std::fs::remove_dir(&former)?;
+        let scope = RegisteredScope::after_uninstall(&former, root.path(), &observed)?;
+        let directory = native::open(&LocalPath::parse(root.path())?, 0, FILE_SHARE_READ)?;
+        let serial = native::volume_serial(directory.leaf())?;
+
+        let matched = registered_shortcut_image(&program, &scope, serial)?;
+        assert_eq!(
+            matched.map(|reference| reference.evidence),
+            Some(MatchKind::AppName)
+        );
+        assert!(registered_shortcut_image(&program, &scope, serial ^ 1)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "run on a disposable Windows VM with fixed NTFS storage"]
+    fn replaced_installation_is_rejected_even_when_the_address_is_unchanged() -> io::Result<()> {
+        let files = crate::files::WindowsFiles::new()?;
+        let root = tempfile::tempdir_in(files.local_app_data())?;
+        let former = root.path().join("Example Editor");
+        std::fs::create_dir(&former)?;
+        let observed = FormerInstallation::capture(&former, root.path())?;
+        std::fs::write(former.join("uninstall-marker"), b"test marker")?;
+        observed.verify(&former)?;
+
+        std::fs::rename(&former, root.path().join("original-directory"))?;
+        std::fs::create_dir(&former)?;
+        assert!(observed.verify(&former).is_err());
+        assert!(RegisteredScope::after_uninstall(&former, root.path(), &observed).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn rejects_wrappers_before_inspecting_a_program_on_disk() {
         let result = prepare_win32_command(
             r"C:\Example\POWERSHELL.exe /x",
             true,
             Path::new(r"C:\Example"),
+            None,
         );
         let Err(error) = result else {
             panic!("wrapper was accepted")
@@ -1047,5 +1925,86 @@ mod tests {
         assert_eq!(classify_win32(0, false), OfficialOutcome::Unverified(0));
         assert_eq!(classify_win32(0, true), OfficialOutcome::Completed);
         assert_eq!(classify_win32(7, true), OfficialOutcome::Failed(7));
+        assert_eq!(classify_win32(7, false), OfficialOutcome::Failed(7));
+    }
+
+    #[test]
+    fn only_confirmed_msi_results_allow_the_pending_marker_to_clear() {
+        for code in [
+            ERROR_INSTALL_SUSPEND,
+            259,         // STILL_ACTIVE is not an Installer result.
+            1726,        // RPC_S_CALL_FAILED does not establish that the request failed to execute.
+            0x8007_0005, // HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED).
+            0xc000_0005, // STATUS_ACCESS_VIOLATION.
+        ] {
+            let unresolved = OfficialOutcome::Unverified(code);
+            assert_eq!(classify_msi(code), unresolved);
+            for reported in [unresolved, OfficialOutcome::Failed(code)] {
+                assert_eq!(
+                    unsettled_msi_execution(reported).map(|execution| execution.outcome),
+                    Some(unresolved)
+                );
+            }
+        }
+        for code in [
+            ERROR_SUCCESS_REBOOT_INITIATED,
+            ERROR_SUCCESS_REBOOT_REQUIRED,
+        ] {
+            assert_eq!(
+                unsettled_msi_execution(classify_msi(code)).map(|execution| execution.outcome),
+                Some(OfficialOutcome::NeedsRestart)
+            );
+        }
+        for code in [
+            ERROR_SUCCESS,
+            ERROR_INSTALL_USEREXIT,
+            ERROR_INSTALL_FAILURE,
+            ERROR_INSTALL_ALREADY_RUNNING,
+            ERROR_ACCESS_DENIED,
+            ERROR_ELEVATION_REQUIRED,
+        ] {
+            assert!(unsettled_msi_execution(classify_msi(code)).is_none());
+        }
+        assert!(unsettled_msi_execution(OfficialOutcome::Unverified(ERROR_SUCCESS)).is_none());
+    }
+
+    #[test]
+    fn force_removal_accepts_failure_but_rejects_permission_and_interrupted_outcomes() {
+        assert!(eligible_win32_failure(7));
+        for code in [
+            ERROR_SUCCESS,
+            ERROR_ACCESS_DENIED,
+            ERROR_ELEVATION_REQUIRED,
+            ERROR_CANCELLED,
+            ERROR_INSTALL_USEREXIT,
+            ERROR_INSTALL_ALREADY_RUNNING,
+            ERROR_INSTALL_SUSPEND,
+            ERROR_SUCCESS_REBOOT_INITIATED,
+            ERROR_SUCCESS_REBOOT_REQUIRED,
+        ] {
+            assert!(!eligible_win32_failure(code), "exit code {code}");
+        }
+    }
+
+    #[test]
+    fn cancelled_wait_checks_for_a_signal_before_returning() -> io::Result<()> {
+        use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+
+        // SAFETY: optional security and name pointers are absent for this private event.
+        let event = unsafe { CreateEventW(null(), 1, 0, null()) };
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateEventW returned a new owned handle.
+        let event = unsafe { OwnedHandle::from_raw_handle(event) };
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        assert!(!wait_for_signal(&event, Some(&cancel))?);
+        // SAFETY: the private event remains live through the call.
+        if unsafe { SetEvent(event.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        assert!(wait_for_signal(&event, Some(&cancel))?);
+        Ok(())
     }
 }

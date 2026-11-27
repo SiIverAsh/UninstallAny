@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import struct
 import tempfile
 import unittest
@@ -46,6 +47,51 @@ def _elf(machine: int, loader: bytes) -> bytes:
 
 
 class PackageReleaseTest(unittest.TestCase):
+    def test_windows_loader_comes_from_the_current_build_script(self) -> None:
+        release_dir = Path("target/fixture/release").resolve()
+        output = release_dir / "build" / "webview2-com-sys-current" / "out"
+        messages = [
+            {
+                "reason": "compiler-artifact",
+                "package_id": "loader-package",
+                "target": {"name": "webview2_com_sys", "kind": ["lib"]},
+            },
+            {
+                "reason": "build-script-executed",
+                "package_id": "other-package",
+                "out_dir": str(output.parent.parent / "unrelated" / "out"),
+            },
+            {
+                "reason": "build-script-executed",
+                "package_id": "loader-package",
+                "out_dir": str(output),
+            },
+        ]
+        events = "\n".join(json.dumps(message) for message in messages)
+        self.assertEqual(
+            release._find_windows_loader(events, release_dir, "x64"),
+            output / "x64" / "WebView2Loader.dll",
+        )
+
+    def test_macos_build_selects_tauri_and_isolates_helper_output(self) -> None:
+        triple = "aarch64-apple-darwin"
+        target = release.TARGETS[triple]
+        with patch.dict("os.environ", {"TAURI_CONFIG": "{}"}):
+            preview, env, preview_dir = release._cargo_build(triple, target)
+            signed, signed_env, signed_dir = release._cargo_build(
+                triple, target, macos_helper=True
+            )
+
+        manifest = release.PROJECT / "apps" / "macos-host" / "Cargo.toml"
+        for args, build_env in ((preview, env), (signed, signed_env)):
+            self.assertEqual(args[args.index("--manifest-path") + 1], str(manifest))
+            self.assertEqual(args[args.index("--bin") + 1], "uninstallany-desktop")
+            self.assertEqual(build_env["MACOSX_DEPLOYMENT_TARGET"], "13.0")
+            self.assertNotIn("TAURI_CONFIG", build_env)
+        self.assertNotIn("--features", preview)
+        self.assertEqual(signed[signed.index("--features") + 1], "macos-privileged-helper")
+        self.assertNotEqual(preview_dir, signed_dir)
+
     def test_macos_rejects_wrong_cpu_or_newer_deployment_target(self) -> None:
         machine = release.TARGETS["aarch64-apple-darwin"].machine
         release._validate_macho(io.BytesIO(_macho(machine, 13 << 16)), machine)

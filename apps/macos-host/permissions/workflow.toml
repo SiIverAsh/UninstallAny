@@ -5,6 +5,7 @@ commands.allow = [
   "list_applications",
   "load_preferences",
   "set_retention",
+  "set_custom_rules",
   "review_uninstall",
   "run_uninstall",
   "apply_cleanup",
@@ -19,4 +20,17 @@ commands.allow = [
 [[permission]]
 identifier = "system-helper-activation"
 description = "Review and approve a signed helper registration separately from uninstall."
+platforms = ["macOS"]
 commands.allow = ["review_system_helper_activation", "run_system_helper_activation"]
+
+[[permission]]
+identifier = "windows-cleanup-previews"
+description = "Preview Windows portable-directory cleanup and force removal."
+platforms = ["windows"]
+commands.allow = ["scan_portable", "scan_force_removal"]
+
+[[permission]]
+identifier = "audit-export"
+description = "Export the local audit journal to a new file."
+platforms = ["macOS", "windows"]
+commands.allow = ["export_audit"]

@@ -7,6 +7,10 @@ edition = "2024"
 rust-version = "1.90"
 publish = false
 
+[[bin]]
+name = "uninstallany-desktop"
+path = "src/main.rs"
+
 [features]
 macos-privileged-helper = ["uninstallany-macos/privileged-inspection"]
 
@@ -14,8 +18,13 @@ macos-privileged-helper = ["uninstallany-macos/privileged-inspection"]
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "=2.12.5", default-features = false, features = ["custom-protocol", "wry"] }
 uninstallany-core = { path = "../../crates/uninstallany-core" }
-uninstallany-macos = { path = "../../crates/uninstallany-macos" }
 uuid = { version = "=1.23.0", features = ["v4", "serde"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+uninstallany-macos = { path = "../../crates/uninstallany-macos" }
+
+[target.'cfg(windows)'.dependencies]
+uninstallany-windows = { path = "../../crates/uninstallany-windows" }
 
 [build-dependencies]
 tauri-build = "=2.7.6"

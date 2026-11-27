@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use rustix::fd::OwnedFd;
 use rustix::fs::{self, Mode, OFlags};
 use uninstallany_core::{Artifact, Journal};
+#[cfg(target_os = "macos")]
+use uninstallany_core::{Cancellation, Error, Result};
 use uuid::Uuid;
 
 use super::{AUDIT_DIR, UnixFiles};
@@ -27,6 +29,47 @@ impl UnixFiles {
         native::require_private(&fd, self.uid)?;
         self.validate_store_volume(native::directory_id(&state)?, &fd)?;
         Ok(fd)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn audit_export_parent(&self, path: &Path) -> io::Result<OwnedFd> {
+        super::check_absolute(path)?;
+        let parent = super::parent_path(path)?;
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+        {
+            return Err(invalid("choose a .jsonl file for the audit report"));
+        }
+        // These personal folders remain protected from cleanup. Creating a new
+        // private report there does not need permission to alter their contents.
+        let export_folders = ["Desktop", "Documents", "Downloads"].map(|name| self.home.join(name));
+        let protected = self.protected.iter().filter(|path| {
+            !export_folders
+                .iter()
+                .any(|allowed| super::same_spelling(path, allowed))
+        });
+        let mut blocked = Vec::new();
+        for root in protected {
+            if super::is_at_or_below(parent, root) {
+                return Err(deny(
+                    "choose an audit report directory outside protected and private state folders",
+                ));
+            }
+            if let Ok(id) = native::protected_id(root) {
+                blocked.push(id);
+            }
+        }
+        let (directory, trusted) =
+            native::open_trusted_path(parent, self.uid, &blocked, self.state_node)?;
+        if !trusted {
+            return Err(deny(
+                "choose a local report directory without shared writes",
+            ));
+        }
+        native::require_current_user_directory(&directory, self.uid)?;
+        native::require_local(&directory)?;
+        Ok(directory)
     }
 
     fn state_directory(&self, create: bool, accept_missing: bool) -> io::Result<OwnedFd> {
@@ -131,6 +174,7 @@ impl Journal for UnixFiles {
         self.state.join(AUDIT_DIR).join(artifact.file_name(id))
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn check_export_path(&self, path: &Path) -> io::Result<()> {
         super::check_absolute(path)?;
         let parent = super::parent_path(path)?;
@@ -142,6 +186,86 @@ impl Journal for UnixFiles {
         }
         native::require_local(&directory)
     }
+
+    #[cfg(target_os = "macos")]
+    fn check_export_path(&self, path: &Path) -> io::Result<()> {
+        self.audit_export_parent(path).map(|_| ())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_audit_export(
+        &self,
+        path: &Path,
+        cancel: &Cancellation,
+        write: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<()> {
+        cancel.check()?;
+        let parent = self.audit_export_parent(path)?;
+        let name = super::filename(path)?;
+        match native::entry_stat(&parent, name) {
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists).into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let staged = format!(".uninstallany-audit-{}.tmp", Uuid::new_v4());
+        let staged = OsStr::new(&staged);
+        let flags =
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::CREATE | OFlags::EXCL;
+        let fd = fs::openat(&parent, staged, flags, PRIVATE_RECORD).map_err(io::Error::from)?;
+        let mut output = File::from(fd);
+        let publish = (|| -> Result<()> {
+            // A mode-0600 file can still inherit an ACL on macOS.
+            native::require_private(&output, self.uid)?;
+            write(&mut output)?;
+            output.sync_all()?;
+            let current = self.audit_export_parent(path)?;
+            if native::directory_id(&current)? != native::directory_id(&parent)? {
+                return Err(deny("the audit report directory changed before publication").into());
+            }
+            native::require_private(&output, self.uid)?;
+            let held = fs::fstat(&output).map_err(io::Error::from)?;
+            let named = native::entry_stat(&parent, staged)?;
+            if held.st_nlink != 1
+                || native::EntryStamp::from_stat(&held) != native::EntryStamp::from_stat(&named)
+            {
+                return Err(deny("the staged audit report changed before publication").into());
+            }
+            cancel.check()?;
+            native::rename_exclusive((&parent, staged), (&parent, name))?;
+            Ok(())
+        })();
+        if let Err(error) = publish {
+            discard_report_stage(&parent, staged, &output).map_err(|cleanup| {
+                Error::Io(io::Error::other(format!(
+                    "{error}. Could not discard temporary audit export {}: {cleanup}",
+                    staged.to_string_lossy(),
+                )))
+            })?;
+            return Err(error);
+        }
+        fs::fsync(&parent).map_err(|error| {
+            io::Error::other(format!(
+                "the report was published but its directory could not be synchronized: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn discard_report_stage(parent: &OwnedFd, name: &OsStr, file: &File) -> io::Result<()> {
+    let named = match native::entry_stat(parent, name) {
+        Ok(named) => named,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let held = native::NodeId::from_stat(&fs::fstat(file)?);
+    if !held.same_inode(native::NodeId::from_stat(&named)) {
+        return Err(deny("the temporary audit name was replaced"));
+    }
+    fs::unlinkat(parent, name, fs::AtFlags::empty())?;
+    Ok(())
 }
 
 fn open_or_create(parent: &OwnedFd, name: &OsStr, create: bool) -> io::Result<OwnedFd> {

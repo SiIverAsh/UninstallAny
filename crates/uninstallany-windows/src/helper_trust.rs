@@ -6,11 +6,14 @@ use std::{
     mem::{offset_of, size_of},
     os::windows::{
         ffi::OsStringExt,
-        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        io::{AsRawHandle, OwnedHandle},
     },
     path::{Path, PathBuf},
     ptr::null_mut,
 };
+
+#[cfg(feature = "privileged-helper")]
+use std::os::windows::io::FromRawHandle;
 
 use windows_sys::Win32::{
     Foundation::{GENERIC_ALL, GENERIC_WRITE, HANDLE, LocalFree},

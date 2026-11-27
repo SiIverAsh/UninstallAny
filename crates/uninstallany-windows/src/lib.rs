@@ -31,6 +31,8 @@ mod uninstall;
 
 #[cfg(windows)]
 pub use platform::open;
+#[cfg(windows)]
+pub use uninstall::{ExitObservation, capture_exit_observation};
 
 #[cfg(all(windows, feature = "privileged-helper"))]
 pub use helper::run_privileged_helper;

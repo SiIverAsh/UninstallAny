@@ -1,23 +1,29 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod dto;
-#[cfg(feature = "macos-privileged-helper")]
+#[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
 mod helper_activation;
 mod session;
 mod worker;
 
-use std::num::NonZeroU16;
+#[cfg(windows)]
+use std::{cell::Cell, rc::Rc};
+use std::{num::NonZeroU16, path::PathBuf};
 
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 use uninstallany_core::AppId;
 use uuid::Uuid;
 
-#[cfg(feature = "macos-privileged-helper")]
+#[cfg(windows)]
+use crate::dto::CleanupPreview;
+#[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
 use crate::helper_activation::{HelperActivationPreviewPayload, HelperActivationReportPayload};
 use crate::{
     dto::{
-        BackupInventoryPayload, ChangeReportPayload, ExpiryReviewPayload, InventoryPayload,
-        LoadedPreferencesPayload, OfficialRow, RestoreReviewPayload, UninstallReviewPayload,
+        AuditExportedPayload, BackupInventoryPayload, ChangeReportPayload, ExpiryReviewPayload,
+        InventoryPayload, LoadedPreferencesPayload, OfficialRow, RestoreReviewPayload,
+        RulesSavedPayload, UninstallReviewPayload,
     },
     worker::{Host, Operation},
 };
@@ -38,6 +44,23 @@ async fn set_retention(days: NonZeroU16, host: State<'_, Host>) -> Result<u16, S
 }
 
 #[tauri::command]
+async fn set_custom_rules(
+    text: String,
+    host: State<'_, Host>,
+) -> Result<RulesSavedPayload, String> {
+    host.run(|reply| Operation::SetCustomRules(text, reply))
+        .await
+}
+
+#[tauri::command]
+async fn export_audit(
+    path: PathBuf,
+    host: State<'_, Host>,
+) -> Result<AuditExportedPayload, String> {
+    host.run(|reply| Operation::ExportAudit(path, reply)).await
+}
+
+#[tauri::command]
 async fn review_uninstall(
     app_ids: Vec<AppId>,
     host: State<'_, Host>,
@@ -52,6 +75,22 @@ async fn run_uninstall(
     host: State<'_, Host>,
 ) -> Result<Vec<OfficialRow>, String> {
     host.run(|reply| Operation::Uninstall(ticket, app, reply))
+        .await
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn scan_portable(path: PathBuf, host: State<'_, Host>) -> Result<CleanupPreview, String> {
+    host.run(|reply| Operation::ScanPortable(path, reply)).await
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn scan_force_removal(
+    app_id: AppId,
+    host: State<'_, Host>,
+) -> Result<CleanupPreview, String> {
+    host.run(|reply| Operation::ScanForceRemoval(app_id, reply))
         .await
 }
 
@@ -99,7 +138,7 @@ async fn purge_expired(
         .await
 }
 
-#[cfg(feature = "macos-privileged-helper")]
+#[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
 #[tauri::command]
 async fn review_system_helper_activation(
     app_id: AppId,
@@ -109,7 +148,7 @@ async fn review_system_helper_activation(
         .await
 }
 
-#[cfg(feature = "macos-privileged-helper")]
+#[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
 #[tauri::command]
 async fn run_system_helper_activation(
     ticket: Uuid,
@@ -131,17 +170,23 @@ fn main() -> tauri::Result<()> {
             list_applications,
             load_preferences,
             set_retention,
+            set_custom_rules,
+            export_audit,
             review_uninstall,
             run_uninstall,
+            #[cfg(windows)]
+            scan_portable,
+            #[cfg(windows)]
+            scan_force_removal,
             apply_cleanup,
             list_backups,
             review_restore,
             run_restore,
             review_expiry,
             purge_expired,
-            #[cfg(feature = "macos-privileged-helper")]
+            #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
             review_system_helper_activation,
-            #[cfg(feature = "macos-privileged-helper")]
+            #[cfg(all(target_os = "macos", feature = "macos-privileged-helper"))]
             run_system_helper_activation,
             cancel_operation,
         ])
@@ -154,13 +199,33 @@ fn main() -> tauri::Result<()> {
         })
         .build(tauri::generate_context!())?;
 
-    // A normal close must not kill the worker mid-quarantine or uninstall.
-    app.run(|app, event| {
-        if let RunEvent::ExitRequested { api, .. } = event
-            && app.state::<Host>().cancel().unwrap_or(true)
-        {
+    #[cfg(windows)]
+    let observation = Rc::new(Cell::new(None));
+    #[cfg(windows)]
+    let captured = Rc::clone(&observation);
+    let on_run_event = move |app: &AppHandle, event| match event {
+        // A normal close must not kill the worker mid-quarantine or uninstall.
+        RunEvent::ExitRequested { api, .. } if app.state::<Host>().cancel().unwrap_or(true) => {
             api.prevent_exit();
         }
-    });
+        #[cfg(windows)]
+        RunEvent::Exit => {
+            // Capture the Job before Tauri starts exit cleanup.
+            captured.set(uninstallany_windows::capture_exit_observation().transpose());
+        }
+        _ => {}
+    };
+    #[cfg(not(windows))]
+    app.run(on_run_event);
+    #[cfg(windows)]
+    {
+        let exit_code = app.run_return(on_run_event);
+        if let Some(observation) = observation.take() {
+            observation?.finish()?;
+        }
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+    }
     Ok(())
 }

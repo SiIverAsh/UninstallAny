@@ -37,6 +37,28 @@ impl Fixture {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn audit_export_keeps_a_file_created_before_publication() -> uninstallany_core::Result<()> {
+    let fixture = Fixture::new()?;
+    let destination = fixture.scope.join("report.jsonl");
+    let cancel = Cancellation::default();
+    let result = fixture
+        .guard
+        .write_audit_export(&destination, &cancel, |output| {
+            io::Write::write_all(output, b"{}\n")?;
+            fs::write(&destination, b"existing")?;
+            Ok(())
+        });
+    assert!(matches!(
+        result,
+        Err(uninstallany_core::Error::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(fs::read(&destination)?, b"existing");
+    assert_eq!(fs::read_dir(&fixture.scope)?.count(), 2);
+    Ok(())
+}
+
 #[test]
 fn mutation_denies_paths_outside_scope_and_inside_protected_trees() -> io::Result<()> {
     let fixture = Fixture::new()?;

@@ -1,12 +1,40 @@
 //! Read-only responses for the Tauri IPC contract.
 
+use std::path::Path;
+
 use serde::Serialize;
 use uninstallany_core::{
-    Access, AppId, AppRecord, BackupInventory, BackupSummary, Candidate, Category, ChangeReport,
-    ChangeResult, CleanupPlan, Confidence, Inventory, ItemResult, LoadedPreferences, MatchKind,
-    OfficialIntent, OfficialOutcome, RecoveryState, RestorePlan, Risk, ScanMode,
+    Access, AppId, AppRecord, AuditExport, BackupInventory, BackupSummary, Candidate, Category,
+    ChangeReport, ChangeResult, CleanupPlan, Confidence, Inventory, ItemResult, LoadedPreferences,
+    MatchKind, OfficialIntent, OfficialOutcome, RecoveryState, RestorePlan, Risk, ScanMode,
 };
 use uuid::Uuid;
+
+/// The local destination and summary of an audit export.
+#[derive(Serialize)]
+pub(crate) struct AuditExportedPayload {
+    path: String,
+    report: AuditExportPayload,
+}
+
+impl AuditExportedPayload {
+    /// Projects the saved export and its diagnostics into the IPC response.
+    pub(crate) fn new(path: &Path, report: AuditExport) -> Self {
+        Self {
+            path: path.display().to_string(),
+            report: AuditExportPayload {
+                written: report.written,
+                warnings: report.warnings,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AuditExportPayload {
+    written: usize,
+    warnings: Vec<String>,
+}
 
 /// Application metadata and diagnostics for the application list.
 #[derive(Serialize)]
@@ -231,10 +259,14 @@ pub(crate) struct ExpiryReviewPayload {
 
 impl ExpiryReviewPayload {
     /// Projects an expiry review without exposing its prepared operations.
-    pub(crate) fn new(ticket: Uuid, entries: &[BackupSummary], warnings: &[String]) -> Self {
+    pub(crate) fn new<'a>(
+        ticket: Uuid,
+        entries: impl Iterator<Item = &'a BackupSummary>,
+        warnings: &[String],
+    ) -> Self {
         Self {
             ticket,
-            entries: entries.iter().cloned().map(Into::into).collect(),
+            entries: entries.cloned().map(Into::into).collect(),
             warnings: warnings.to_vec(),
         }
     }
@@ -335,4 +367,11 @@ impl From<&LoadedPreferences> for LoadedPreferencesPayload {
             warnings: preferences.warnings.clone(),
         }
     }
+}
+
+/// The accepted rule text and number of active custom rules.
+#[derive(Serialize)]
+pub(crate) struct RulesSavedPayload {
+    pub(crate) text: String,
+    pub(crate) count: usize,
 }

@@ -2,6 +2,7 @@
 
 use std::{
     ffi::OsStr,
+    fmt::Display,
     io,
     mem::size_of,
     os::windows::{
@@ -12,6 +13,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use uninstallany_core::Cancellation;
 use uuid::Uuid;
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
@@ -32,8 +34,8 @@ use crate::{
     helper_ipc,
     helper_msi::MachineMsiRequest,
     helper_trust::{self, TrustedExecutable},
-    registry::InstalledEntry,
-    uninstall::OfficialOutcome,
+    registry::{InstalledEntry, SystemUninstallWait, SystemUninstaller},
+    uninstall::{NativeExecution, OfficialOutcome, unsettled_msi_execution},
 };
 
 const PROTOCOL: &str = "--msi-worker-v1";
@@ -43,6 +45,7 @@ const INSTALLER_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Reply {
     Outcome(OfficialOutcome),
+    Unsettled(OfficialOutcome),
     Rejected(String),
 }
 
@@ -61,31 +64,74 @@ impl PreparedMsi {
         })
     }
 
-    pub(super) fn execute(self) -> io::Result<OfficialOutcome> {
+    /// Sends the approved request and keeps its write guard until completion is known.
+    pub(super) fn execute(self, cancel: &Cancellation) -> io::Result<NativeExecution> {
         let gui = helper_trust::pin_gui()?;
         gui.verify_current_process()?;
         let request = serde_json::to_vec(&self.request).map_err(io::Error::other)?;
         let token = Uuid::new_v4();
+        if cancel.check().is_err() {
+            return Ok(NativeExecution::finished(OfficialOutcome::Cancelled));
+        }
         let process = match launch_helper(&self.helper, token) {
             Ok(process) => process,
             Err(error) if error.raw_os_error() == Some(ERROR_CANCELLED as i32) => {
-                return Ok(OfficialOutcome::Cancelled);
+                return Ok(NativeExecution::finished(OfficialOutcome::Cancelled));
             }
             Err(error) => return Err(error),
         };
         self.helper.verify_process(&process)?;
         let mut channel = helper_ipc::connect(token, &process)?;
-        channel.send(&request)?;
-        let response = channel.receive(INSTALLER_TIMEOUT).map_err(|error| {
-            io::Error::other(format!(
-                "the elevated installer outcome is unknown ({error})"
-            ))
-        })?;
-        match serde_json::from_slice(&response).map_err(io::Error::other)? {
-            Reply::Outcome(outcome) => Ok(outcome),
-            Reply::Rejected(reason) => Err(io::Error::other(format!("MSI helper: {reason}"))),
+        if cancel.check().is_err() {
+            return Ok(NativeExecution::finished(OfficialOutcome::Cancelled));
         }
+        let wait = SystemUninstallWait::begin(SystemUninstaller::ElevatedMsi)?;
+        let outcome = if cancel.check().is_err() {
+            OfficialOutcome::Cancelled
+        } else {
+            // A pipe write can complete even if its caller observes an error.
+            // The v1 rejection also covers errors after native dispatch.
+            let response = channel
+                .send(&request)
+                .and_then(|()| channel.receive(INSTALLER_TIMEOUT))
+                .and_then(|bytes| {
+                    serde_json::from_slice::<Reply>(&bytes).map_err(io::Error::other)
+                });
+            match response {
+                Ok(Reply::Outcome(outcome)) => {
+                    // Older helpers sent this reply for both completed and unsettled MSI work.
+                    if let Some(execution) = unsettled_msi_execution(outcome) {
+                        return Ok(execution);
+                    }
+                    outcome
+                }
+                Ok(Reply::Unsettled(outcome)) => {
+                    return Ok(unsettled_msi_execution(outcome).unwrap_or_else(|| {
+                        unverified_helper_outcome(
+                            "the helper reported an inconsistent unsettled result",
+                        )
+                    }));
+                }
+                Ok(Reply::Rejected(reason)) => {
+                    return Ok(unverified_helper_outcome(format!("MSI helper: {reason}")));
+                }
+                Err(error) => return Ok(unverified_helper_outcome(error)),
+            }
+        };
+        let execution = NativeExecution::finished(outcome);
+        Ok(match wait.finish() {
+            Ok(()) => execution,
+            Err(error) => execution.with_warning(format!(
+                "Could not clear the elevated Windows Installer tracking entry ({error}). Further changes may remain blocked."
+            )),
+        })
     }
+}
+
+fn unverified_helper_outcome(error: impl Display) -> NativeExecution {
+    NativeExecution::finished(OfficialOutcome::Unverified(0)).with_warning(format!(
+        "The elevated Windows Installer outcome could not be verified ({error}). Further changes remain blocked while this request is unresolved."
+    ))
 }
 
 fn launch_helper(helper: &TrustedExecutable, token: Uuid) -> io::Result<OwnedHandle> {
@@ -209,7 +255,12 @@ pub fn run_privileged_helper() -> io::Result<()> {
         request.execute()
     });
     let reply = match result {
-        Ok(outcome) => Reply::Outcome(outcome),
+        Ok(outcome) => match unsettled_msi_execution(outcome) {
+            // The v1 desktop that lacks this variant treats it as an unreadable
+            // result, so it leaves its pending marker in place.
+            Some(execution) => Reply::Unsettled(execution.outcome),
+            None => Reply::Outcome(outcome),
+        },
         Err(error) => Reply::Rejected(error.to_string().chars().take(512).collect()),
     };
     channel.send(&serde_json::to_vec(&reply).map_err(io::Error::other)?)

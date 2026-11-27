@@ -32,6 +32,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Variant",
     "Win32_System_WinRT",
 ] }
+windows-future = "0.3.2"
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -41,6 +42,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_ApplicationInstallationAndServicing",
     "Win32_System_Com",
     "Win32_System_Environment",
@@ -56,6 +58,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = "3"

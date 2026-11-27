@@ -5,6 +5,8 @@
   "permissions": [
     "uninstall-workflow",
     "system-helper-activation",
+    "windows-cleanup-previews",
+    "audit-export",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

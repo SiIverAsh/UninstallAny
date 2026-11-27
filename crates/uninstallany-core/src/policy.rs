@@ -1,6 +1,34 @@
 use std::path::{Component, Path};
 
-use crate::{MatchKind, RegistryTarget};
+use crate::{MatchKind, RegistryHive, RegistryTarget, RegistryView};
+
+const APP_PATHS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths";
+const PROTECTED_APP_PATH_PROGRAMS: &[&str] = &[
+    "calc",
+    "cmd",
+    "command",
+    "control",
+    "cscript",
+    "explorer",
+    "hh",
+    "mmc",
+    "mshta",
+    "msiexec",
+    "notepad",
+    "powershell",
+    "pwsh",
+    "reg",
+    "regasm",
+    "regedit",
+    "regsvr32",
+    "rundll32",
+    "schtasks",
+    "svchost",
+    "taskmgr",
+    "winlogon",
+    "wmic",
+    "wscript",
+];
 
 const GENERIC_TERMS: &[&str] = &[
     "app",
@@ -78,6 +106,45 @@ pub fn match_name(
     (is_prefix || is_suffix).then_some(MatchKind::FuzzyName)
 }
 
+/// Identifies an eligible App Paths default-value address in the current user view.
+///
+/// A native backend must still establish ownership and verify the registered executable.
+pub fn is_current_user_app_path_default_target(target: &RegistryTarget) -> bool {
+    if target.hive != RegistryHive::CurrentUser
+        || target.view != RegistryView::Native
+        || target.value.as_deref() != Some("")
+    {
+        return false;
+    }
+    let Some((parent, leaf)) = target.key.rsplit_once('\\') else {
+        return false;
+    };
+    let Some((stem, extension)) = leaf.rsplit_once('.') else {
+        return false;
+    };
+    if !parent.eq_ignore_ascii_case(APP_PATHS_KEY)
+        || !extension.eq_ignore_ascii_case("exe")
+        || stem.trim() != stem
+        || stem.starts_with('.')
+        || stem.ends_with('.')
+        || stem.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '[' | ']' | '%'
+                )
+        })
+    {
+        return false;
+    }
+    let normalized = normalized_name(stem);
+    is_specific(&normalized)
+        && !is_builtin(stem)
+        && !normalized.starts_with("microsoft")
+        && !normalized.starts_with("windows")
+        && !PROTECTED_APP_PATH_PROGRAMS.contains(&normalized.as_str())
+}
+
 /// Rejects protected or noncanonical registry targets before a platform can write.
 pub fn is_protected_registry_target(target: &RegistryTarget) -> bool {
     let canonical = target.key.to_lowercase();
@@ -101,15 +168,15 @@ pub fn is_protected_registry_target(target: &RegistryTarget) -> bool {
             "currentversion",
             "uninstall",
             leaf,
-        ]
-        | [
+        ] => target.value.is_some() || is_builtin(leaf),
+        [
             "software",
             "microsoft",
             "windows",
             "currentversion",
             "app paths",
-            leaf,
-        ] => target.value.is_some() || is_builtin(leaf),
+            ..,
+        ] => !is_current_user_app_path_default_target(target),
         [
             "software",
             "microsoft",
@@ -155,8 +222,6 @@ pub(crate) fn valid_file_address(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{RegistryHive, RegistryView};
-
     use super::*;
 
     #[test]
@@ -242,5 +307,73 @@ mod tests {
             r"Software\Studio Eight",
             None
         )));
+    }
+
+    #[test]
+    fn app_paths_policy_only_allows_the_current_user_native_executable_default() {
+        let allowed = RegistryTarget {
+            hive: RegistryHive::CurrentUser,
+            view: RegistryView::Native,
+            key: format!(r"{APP_PATHS_KEY}\Scope Sample.EXE"),
+            value: Some(String::new()),
+        };
+        assert!(is_current_user_app_path_default_target(&allowed));
+        assert!(!is_protected_registry_target(&allowed));
+
+        for rejected in [
+            RegistryTarget {
+                hive: RegistryHive::LocalMachine,
+                ..allowed.clone()
+            },
+            RegistryTarget {
+                view: RegistryView::Registry32,
+                ..allowed.clone()
+            },
+            RegistryTarget {
+                view: RegistryView::Registry64,
+                ..allowed.clone()
+            },
+            RegistryTarget {
+                value: None,
+                ..allowed.clone()
+            },
+            RegistryTarget {
+                value: Some("Path".into()),
+                ..allowed.clone()
+            },
+            RegistryTarget {
+                key: APP_PATHS_KEY.into(),
+                ..allowed.clone()
+            },
+        ] {
+            assert!(
+                !is_current_user_app_path_default_target(&rejected),
+                "{rejected:?}"
+            );
+            assert!(is_protected_registry_target(&rejected), "{rejected:?}");
+        }
+
+        for leaf in [
+            r"Nested\Scope Sample.exe",
+            "Scope Sample.dll",
+            "Scope/Sample.exe",
+            "Scope]Sample.exe",
+            "Scope Sample.exe ",
+            "Scope Sample .exe",
+            "Common.exe",
+            "powershell.exe",
+            "MicrosoftEdge.exe",
+            "Windows Terminal.exe",
+        ] {
+            let rejected = RegistryTarget {
+                key: format!(r"{APP_PATHS_KEY}\{leaf}"),
+                ..allowed.clone()
+            };
+            assert!(
+                !is_current_user_app_path_default_target(&rejected),
+                "{leaf}"
+            );
+            assert!(is_protected_registry_target(&rejected), "{leaf}");
+        }
     }
 }

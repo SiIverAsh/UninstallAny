@@ -12,6 +12,8 @@ use uuid::Uuid;
 use crate::*;
 
 const AUDIT_WRITE_FAILURE: &str = "intentional audit write failure";
+const CLEANUP_INELIGIBLE: &str = "fixture application reappeared during cleanup";
+const CLEANUP_OBSERVATION_CHANGED: &str = "fixture cleanup observation changed";
 
 #[derive(Clone, Debug)]
 struct MockFile {
@@ -31,14 +33,39 @@ struct MockState {
     purge_ineligible: HashSet<PathBuf>,
     purge_failure_after_removal: bool,
     registry: HashMap<RegistryTarget, String>,
+    registry_receipts: Option<HashMap<Uuid, MockRegistryReceipt>>,
     applications: Vec<AppRecord>,
     launches: Vec<AppId>,
     official_absence_checks: Vec<AppId>,
     official_error: Option<&'static str>,
     cancel_on_official_completion: Option<Cancellation>,
+    cleanup_checks_before_rejection: Option<usize>,
+    cleanup_observations: Option<MockCleanupObservations>,
     cancel_during_scan: bool,
     next_scan_error: Option<io::Error>,
     scan_count: usize,
+}
+
+struct MockRegistryReceipt {
+    target: RegistryTarget,
+    snapshot: Vec<u8>,
+    state: RegistryChangeReceipt,
+}
+
+struct MockCleanupObservations {
+    files: HashMap<PathBuf, String>,
+    checks_before_rejection: usize,
+    checks: usize,
+}
+
+impl MockCleanupObservations {
+    fn new(checks_before_rejection: usize) -> Self {
+        Self {
+            files: HashMap::from([(path("apps/old-install"), "original identity".into())]),
+            checks_before_rejection,
+            checks: 0,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -401,6 +428,74 @@ impl RegistryStore for Fake {
         state.registry.insert(target.clone(), value);
         Ok(())
     }
+
+    fn remove_registry_with_receipt(
+        &self,
+        target: &RegistryTarget,
+        expected: &str,
+        operation_id: Uuid,
+        write: &mut RegistryBackupWriter<'_>,
+    ) -> io::Result<()> {
+        let mut written_snapshot = Vec::new();
+        self.remove_registry(target, expected, &mut |export, snapshot| {
+            write(export, snapshot)?;
+            written_snapshot.extend_from_slice(snapshot);
+            Ok(())
+        })?;
+        if let Some(receipts) = &mut self.0.borrow_mut().registry_receipts {
+            receipts.insert(
+                operation_id,
+                MockRegistryReceipt {
+                    target: target.clone(),
+                    snapshot: written_snapshot,
+                    state: RegistryChangeReceipt::Applied,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn restore_registry_with_receipt(
+        &self,
+        target: &RegistryTarget,
+        snapshot: &[u8],
+        operation_id: Uuid,
+    ) -> io::Result<()> {
+        self.restore_registry(target, snapshot)?;
+        if let Some(receipts) = &mut self.0.borrow_mut().registry_receipts {
+            receipts.insert(
+                operation_id,
+                MockRegistryReceipt {
+                    target: target.clone(),
+                    snapshot: snapshot.to_vec(),
+                    state: RegistryChangeReceipt::Restored,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn registry_change_receipt(
+        &self,
+        target: &RegistryTarget,
+        snapshot: &[u8],
+        operation_id: Uuid,
+    ) -> io::Result<Option<RegistryChangeReceipt>> {
+        let state = self.0.borrow();
+        let receipt = state
+            .registry_receipts
+            .as_ref()
+            .and_then(|receipts| receipts.get(&operation_id));
+        match receipt {
+            Some(receipt)
+                if &receipt.target == target && receipt.snapshot.as_slice() == snapshot =>
+            {
+                Ok(Some(receipt.state))
+            }
+            Some(_) => Err(io::ErrorKind::InvalidData.into()),
+            None => Ok(None),
+        }
+    }
 }
 
 impl PlatformBackend for Fake {
@@ -507,6 +602,28 @@ impl PlatformBackend for Fake {
         Ok(OfficialOutcome::Completed)
     }
 
+    fn run_official_with_cancel(
+        &self,
+        command: Self::Official,
+        cancel: &Cancellation,
+    ) -> Result<OfficialExecution> {
+        cancel.check()?;
+        let outcome = self.run_official(command)?;
+        let state = self.0.borrow();
+        let observed_files = state
+            .cleanup_observations
+            .as_ref()
+            .map(|observations| observations.files.clone())
+            .unwrap_or_default();
+        Ok(OfficialExecution {
+            outcome,
+            warnings: Vec::new(),
+            read_only_residuals: Vec::new(),
+            observed_files,
+            post_uninstall_check: None,
+        })
+    }
+
     fn verify_finished_official_after_cancel(&self) -> bool {
         self.0.borrow().cancel_on_official_completion.is_some()
     }
@@ -518,6 +635,38 @@ impl PlatformBackend for Fake {
             inventory.warnings.is_empty()
                 && !inventory.applications.iter().any(|app| &app.id == id),
         )
+    }
+
+    fn check_cleanup_after_uninstall(&self, _app: &AppRecord, cancel: &Cancellation) -> Result<()> {
+        cancel.check()?;
+        let mut state = self.0.borrow_mut();
+        let Some(remaining) = &mut state.cleanup_checks_before_rejection else {
+            return Ok(());
+        };
+        if *remaining == 0 {
+            return Err(Error::Rejected(CLEANUP_INELIGIBLE.into()));
+        }
+        *remaining -= 1;
+        Ok(())
+    }
+
+    fn check_cleanup_observations(
+        &self,
+        _app: &AppRecord,
+        observed_files: &HashMap<PathBuf, String>,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        cancel.check()?;
+        let mut state = self.0.borrow_mut();
+        let Some(mock) = &mut state.cleanup_observations else {
+            return Ok(());
+        };
+        assert_eq!(observed_files, &mock.files);
+        mock.checks += 1;
+        if mock.checks > mock.checks_before_rejection {
+            return Err(Error::Rejected(CLEANUP_OBSERVATION_CHANGED.into()));
+        }
+        Ok(())
     }
 }
 
@@ -950,6 +1099,58 @@ fn registry_backup_failure_leaves_the_original_value_and_others_continue() -> Re
 }
 
 #[test]
+fn app_paths_default_is_cleaned_before_its_executable_and_restored_after_it() -> Result<()> {
+    let fake = Fake::default();
+    let app = application("Scope Sample");
+    let executable = path("apps/Scope Sample.exe");
+    let app_path = RegistryTarget {
+        hive: RegistryHive::CurrentUser,
+        view: RegistryView::Native,
+        key: r"Software\Microsoft\Windows\CurrentVersion\App Paths\Scope Sample.exe".into(),
+        value: Some(String::new()),
+    };
+    {
+        let mut state = fake.0.borrow_mut();
+        state.applications.push(app.clone());
+        state.files.insert(executable.clone(), file("image"));
+        state
+            .registry
+            .insert(app_path.clone(), executable.display().to_string());
+    }
+    let engine = Engine::new(fake, MemoryJournal::default());
+    let cancel = Cancellation::default();
+    let plan = engine.scan(&app.id, &cancel)?;
+    let file_target = Target::File(executable);
+    let registry_target = Target::Registry(app_path);
+    assert_eq!(
+        plan.candidates().next().map(|candidate| &candidate.target),
+        Some(&file_target)
+    );
+    let selection: Vec<_> = plan.candidates().map(|candidate| candidate.id).collect();
+    let report = engine.apply(plan.confirm(&selection)?, &cancel)?;
+    let file_display = file_target.display();
+    let registry_display = registry_target.display();
+    let [registry, file] = report.items.as_slice() else {
+        panic!("expected App Paths and file cleanup results");
+    };
+    assert_eq!(registry.target, registry_display);
+    assert_eq!(file.target, file_display);
+    assert!(matches!(registry.result, ChangeResult::Applied));
+    assert!(matches!(file.result, ChangeResult::Applied));
+
+    let restore = engine.prepare_restore(report.batch_id)?;
+    let report = engine.restore(restore.confirm()?, &cancel)?;
+    let [file, registry] = report.items.as_slice() else {
+        panic!("expected file and App Paths restoration results");
+    };
+    assert_eq!(file.target, file_display);
+    assert_eq!(registry.target, registry_display);
+    assert!(matches!(file.result, ChangeResult::Restored));
+    assert!(matches!(registry.result, ChangeResult::Restored));
+    Ok(())
+}
+
+#[test]
 fn restore_keeps_conflicting_files_and_restores_the_exact_registry_value() -> Result<()> {
     let fake = Fake::default();
     let path = path("apps/tool.dll");
@@ -999,6 +1200,58 @@ fn restore_keeps_conflicting_files_and_restores_the_exact_registry_value() -> Re
     assert_eq!(fake.0.borrow().files[&path].stamp, "new");
     assert_eq!(fake.0.borrow().registry[&key], "fixture value");
     assert_eq!(fake.0.borrow().quarantine.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn registry_transaction_receipts_recover_without_writing_the_backup_list() -> Result<()> {
+    let fake = Fake::default();
+    let key = registry_target();
+    {
+        let mut state = fake.0.borrow_mut();
+        state.registry.insert(key.clone(), "fixture value".into());
+        state.registry_receipts = Some(HashMap::new());
+    }
+    let journal = MemoryJournal::default();
+    let engine = Engine::new(fake.clone(), journal.clone());
+    let cancel = Cancellation::default();
+    journal.0.borrow_mut().fail = Some(Artifact::Applied);
+    let cleanup = engine
+        .scan_portable(&path("apps"), &cancel)?
+        .confirm(&[0])?;
+    let changed = engine.apply(cleanup, &cancel)?;
+    assert!(matches!(
+        changed.items[0].result,
+        ChangeResult::NeedsReview(_)
+    ));
+    assert!(!fake.0.borrow().registry.contains_key(&key));
+
+    let before_list = journal.0.borrow().records.clone();
+    let inventory = engine.backups()?;
+    assert!(inventory.warnings.is_empty());
+    assert_eq!(inventory.items[0].state, RecoveryState::Applied);
+    assert_eq!(journal.0.borrow().records, before_list);
+
+    let restore = engine.prepare_restore(changed.batch_id)?.confirm()?;
+    let stale_restore = engine.prepare_restore(changed.batch_id)?.confirm()?;
+    journal.0.borrow_mut().fail = Some(Artifact::Restored);
+    let restored = engine.restore(restore, &cancel)?;
+    assert!(matches!(
+        restored.items[0].result,
+        ChangeResult::NeedsReview(_)
+    ));
+    assert_eq!(fake.0.borrow().registry[&key], "fixture value");
+
+    // A later absence cannot turn the prior restore into a new authorization.
+    fake.0.borrow_mut().registry.remove(&key);
+    let before_list = journal.0.borrow().records.clone();
+    let inventory = engine.backups()?;
+    assert!(inventory.warnings.is_empty());
+    assert_eq!(inventory.items[0].state, RecoveryState::Restored);
+    assert_eq!(journal.0.borrow().records, before_list);
+    let rejected = engine.restore(stale_restore, &cancel)?;
+    assert!(matches!(rejected.items[0].result, ChangeResult::Skipped(_)));
+    assert!(!fake.0.borrow().registry.contains_key(&key));
     Ok(())
 }
 
@@ -1405,6 +1658,31 @@ fn official_queue_keeps_failures_independent_and_scans_after_verified_removal() 
 }
 
 #[test]
+fn official_uninstall_rejects_lost_eligibility_after_confirmation() -> Result<()> {
+    let fake = Fake::default();
+    let app = AppRecord {
+        publisher: Some("Studio Eight".into()),
+        version: Some("1.0".into()),
+        install_location: Some(path("apps/example-tool")),
+        ..application("Example Tool")
+    };
+    fake.0.borrow_mut().applications.push(app.clone());
+    let engine = Engine::new(fake.clone(), MemoryJournal::default());
+    let cancel = Cancellation::default();
+    let confirmed = engine.prepare_uninstall(&app.id, &cancel)?.confirm()?;
+
+    fake.0.borrow_mut().applications[0].official_uninstall_available = false;
+
+    assert!(matches!(
+        engine.run_uninstall(confirmed, &cancel),
+        Err(Error::Rejected(reason))
+            if reason == "the application no longer has an available uninstall action"
+    ));
+    assert!(fake.0.borrow().launches.is_empty());
+    Ok(())
+}
+
+#[test]
 fn failed_uninstall_start_audit_prevents_native_execution() -> Result<()> {
     let fake = Fake::default();
     let app = application("audit-start");
@@ -1484,6 +1762,180 @@ fn uninstall_retains_native_error_when_its_outcome_audit_fails() -> Result<()> {
     let state = fake.0.borrow();
     assert_eq!(state.launches, [app.id]);
     assert!(state.official_absence_checks.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cleanup_guard_rejection_preserves_verified_uninstall_without_scanning() -> Result<()> {
+    let app = application("cleanup-preview");
+    let fake = Fake(Rc::new(RefCell::new(MockState {
+        applications: vec![app.clone()],
+        cleanup_checks_before_rejection: Some(0),
+        ..MockState::default()
+    })));
+    let engine = Engine::new(fake.clone(), MemoryJournal::default());
+    let cancel = Cancellation::default();
+    let confirmed = engine.prepare_uninstall(&app.id, &cancel)?.confirm()?;
+
+    let report = engine.run_uninstall(confirmed, &cancel)?;
+
+    assert_eq!(report.outcome, OfficialOutcome::Completed);
+    assert!(report.cleanup.is_none());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(CLEANUP_INELIGIBLE))
+    );
+    let state = fake.0.borrow();
+    assert_eq!(state.official_absence_checks, [app.id]);
+    assert_eq!(state.scan_count, 0);
+    Ok(())
+}
+
+#[test]
+fn cleanup_observation_rejection_preserves_verified_uninstall_without_scanning() -> Result<()> {
+    let app = application("changed-cleanup-observation");
+    let fake = Fake(Rc::new(RefCell::new(MockState {
+        applications: vec![app.clone()],
+        cleanup_observations: Some(MockCleanupObservations::new(0)),
+        ..MockState::default()
+    })));
+    let engine = Engine::new(fake.clone(), MemoryJournal::default());
+    let cancel = Cancellation::default();
+    let confirmed = engine.prepare_uninstall(&app.id, &cancel)?.confirm()?;
+    let report = engine.run_uninstall(confirmed, &cancel)?;
+
+    assert_eq!(report.outcome, OfficialOutcome::Completed);
+    assert!(report.cleanup.is_none());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(CLEANUP_OBSERVATION_CHANGED))
+    );
+    let state = fake.0.borrow();
+    assert_eq!(state.official_absence_checks, [app.id]);
+    assert_eq!(state.scan_count, 0);
+    assert_eq!(
+        state.cleanup_observations.as_ref().map(|mock| mock.checks),
+        Some(1)
+    );
+    Ok(())
+}
+
+#[test]
+fn changed_cleanup_observation_blocks_rescan_and_both_mutation_boundaries() -> Result<()> {
+    for accepted_checks in [1, 2] {
+        let app = application("cleanup-observation-changes");
+        let residual = path("apps/leftover.dll");
+        let setting = registry_target();
+        let fake = Fake(Rc::new(RefCell::new(MockState {
+            applications: vec![app.clone()],
+            files: HashMap::from([(residual.clone(), file("intact"))]),
+            registry: HashMap::from([(setting.clone(), "intact".into())]),
+            cleanup_observations: Some(MockCleanupObservations::new(accepted_checks)),
+            ..MockState::default()
+        })));
+        let journal = MemoryJournal::default();
+        let engine = Engine::new(fake.clone(), journal.clone());
+        let cancel = Cancellation::default();
+        let confirmed = engine.prepare_uninstall(&app.id, &cancel)?.confirm()?;
+        let uninstall = engine.run_uninstall(confirmed, &cancel)?;
+        assert_eq!(uninstall.outcome, OfficialOutcome::Completed);
+        let preview = uninstall
+            .cleanup
+            .expect("the first observation check permits preview");
+        let selected: Vec<_> = preview.candidates().map(|candidate| candidate.id).collect();
+        let applied = engine.apply(preview.confirm(&selected)?, &cancel);
+
+        let expected_checks = if accepted_checks == 1 {
+            assert!(
+                matches!(applied, Err(Error::Rejected(reason)) if reason == CLEANUP_OBSERVATION_CHANGED)
+            );
+            2
+        } else {
+            let report = applied?;
+            assert_eq!(report.items.len(), 2);
+            assert!(report.items.iter().all(|item| {
+                matches!(&item.result, ChangeResult::Skipped(reason) if reason == CLEANUP_OBSERVATION_CHANGED)
+            }));
+            4
+        };
+        let state = fake.0.borrow();
+        assert_eq!(
+            state.cleanup_observations.as_ref().map(|mock| mock.checks),
+            Some(expected_checks)
+        );
+        assert_eq!(state.files[&residual].stamp, "intact");
+        assert_eq!(state.registry[&setting], "intact");
+        assert!(state.quarantine.is_empty());
+        assert!(journal.list(Artifact::RegistryExport)?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn cleanup_guard_rejects_file_and_registry_changes_mid_batch() -> Result<()> {
+    let app = application("cleanup-batch");
+    let first_file = path("apps/first.dll");
+    let second_file = path("apps/second.dll");
+    let setting = registry_target();
+    let fake = Fake(Rc::new(RefCell::new(MockState {
+        applications: vec![app.clone()],
+        files: HashMap::from([
+            (first_file.clone(), file("first")),
+            (second_file.clone(), file("second")),
+        ]),
+        registry: HashMap::from([(setting.clone(), "unchanged".into())]),
+        // Permit the preview, the recheck, and the first file's move.
+        cleanup_checks_before_rejection: Some(3),
+        ..MockState::default()
+    })));
+    let journal = MemoryJournal::default();
+    let engine = Engine::new(fake.clone(), journal.clone());
+    let cancel = Cancellation::default();
+    let confirmed = engine.prepare_uninstall(&app.id, &cancel)?.confirm()?;
+    let uninstall = engine.run_uninstall(confirmed, &cancel)?;
+    let plan = uninstall
+        .cleanup
+        .ok_or_else(|| Error::Rejected("expected a cleanup preview".into()))?;
+    let selected: Vec<_> = plan.candidates().map(|candidate| candidate.id).collect();
+
+    let report = engine.apply(plan.confirm(&selected)?, &cancel)?;
+
+    let [applied, skipped_file, skipped_registry] = report.items.as_slice() else {
+        panic!("expected three cleanup results, got {:?}", report.items);
+    };
+    assert!(matches!(applied.result, ChangeResult::Applied));
+    assert_eq!(
+        skipped_file.target,
+        Target::File(second_file.clone()).display()
+    );
+    assert!(matches!(
+        &skipped_file.result,
+        ChangeResult::Skipped(reason) if reason == CLEANUP_INELIGIBLE
+    ));
+    assert!(skipped_file.backup_id.is_some());
+    assert_eq!(
+        skipped_registry.target,
+        Target::Registry(setting.clone()).display()
+    );
+    assert!(matches!(
+        &skipped_registry.result,
+        ChangeResult::Skipped(reason) if reason == CLEANUP_INELIGIBLE
+    ));
+    assert!(skipped_registry.backup_id.is_none());
+    let state = fake.0.borrow();
+    assert_eq!(state.scan_count, 2);
+    assert_eq!(state.quarantine.len(), 1);
+    assert!(!state.files.contains_key(&first_file));
+    assert!(state.files.contains_key(&second_file));
+    assert_eq!(
+        state.registry.get(&setting).map(String::as_str),
+        Some("unchanged")
+    );
+    assert!(journal.list(Artifact::RegistryExport)?.is_empty());
     Ok(())
 }
 

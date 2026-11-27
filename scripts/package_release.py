@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import tomllib
 import zipfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Final
@@ -29,12 +30,32 @@ PACKAGE: Final = "uninstallany-gui"
 BUNDLE_ID: Final = "io.github.siiverash.uninstallany"
 MACOS_MINIMUM: Final = "13.0"
 MACOS_BACKEND: Final = PROJECT / "crates" / "uninstallany-macos"
+TAURI_MANIFEST: Final = PROJECT / "apps" / "macos-host" / "Cargo.toml"
+TAURI_DESKTOP: Final = "uninstallany-desktop"
 MACOS_HELPER_FEATURE: Final = "macos-privileged-helper"
 MACOS_HELPER_NAME: Final = "UninstallAnyPrivilegedHelper"
 MACOS_HELPER_ID: Final = f"{BUNDLE_ID}.privileged-helper"
 MACOS_HELPER_PLIST: Final = f"{MACOS_HELPER_ID}.plist"
 MACOS_HELPER_PATH: Final = Path("Contents/MacOS") / MACOS_HELPER_NAME
 MACOS_JOB_PATH: Final = Path("Contents/Library/LaunchDaemons") / MACOS_HELPER_PLIST
+WINDOWS_LOADER_NAME: Final = "WebView2Loader.dll"
+WINDOWS_DYNAMIC_TARGET: Final = "x86_64-pc-windows-gnullvm"
+WINDOWS_PORTABLE_README: Final = """UninstallAny Windows x64 便携预览
+
+系统需已安装 Microsoft Edge WebView2 Runtime。
+解压全部文件，再以普通用户打开 UninstallAny.exe。
+本包沿用输入文件的签名状态。未签名的桌面程序适用于本地预览。
+机器级 MSI 提权功能需要单独部署的签名助手和受保护的安装目录。
+
+UninstallAny Windows x64 portable preview
+
+Microsoft Edge WebView2 Runtime must already be installed.
+Extract all files and start UninstallAny.exe as a standard user.
+The archive preserves the input files' signature state. An unsigned desktop
+executable is intended for local preview.
+Machine-wide MSI elevation requires a separately deployed, signed helper
+and a protected installation directory.
+"""
 CODESIGN: Final = "/usr/bin/codesign"
 TEAM_LINE: Final = re.compile(r"^TeamIdentifier=([A-Z0-9]{10})$", re.MULTILINE)
 SIGNATURE_FLAGS: Final = re.compile(r"\bflags=0x([0-9a-fA-F]+)\(")
@@ -82,7 +103,7 @@ class Target:
 
 TARGETS: Final = {
     "x86_64-pc-windows-msvc": Target("windows", "x64", 0x8664),
-    "x86_64-pc-windows-gnullvm": Target("windows", "x64", 0x8664),
+    WINDOWS_DYNAMIC_TARGET: Target("windows", "x64", 0x8664),
     "aarch64-apple-darwin": Target("macos", "arm64", 0x0100000C),
     "x86_64-apple-darwin": Target("macos", "x64", 0x01000007),
     "aarch64-unknown-linux-gnu": Target(
@@ -134,59 +155,77 @@ def _project_version() -> str:
     return version
 
 
-def _cargo_build(triple: str, target: Target) -> tuple[list[str], dict[str, str]]:
+def _cargo_build(
+    triple: str, target: Target, *, macos_helper: bool = False
+) -> tuple[list[str], dict[str, str], Path]:
     env = os.environ.copy()
+    build_dir = PROJECT / "target"
+    if target.system == "macos":
+        # Concurrent preview and signed builds must not replace each other's executable.
+        build_dir /= "macos-host-with-helper" if macos_helper else "macos-host"
+    elif target.system == "windows":
+        build_dir /= "macos-host"
     args = [
         "cargo",
         "build",
         "--release",
         "--offline",
         "--locked",
-        "--package",
-        PACKAGE,
         "--target",
         triple,
         "--target-dir",
-        str(PROJECT / "target"),
+        str(build_dir),
     ]
     if target.system == "macos":
         env["MACOSX_DEPLOYMENT_TARGET"] = MACOS_MINIMUM
+    if target.system in {"macos", "windows"}:
+        # Use the checked-in asset location and content security policy.
+        env.pop("TAURI_CONFIG", None)
+        args.extend(("--manifest-path", str(TAURI_MANIFEST), "--bin", TAURI_DESKTOP))
+        if macos_helper:
+            args.extend(("--features", MACOS_HELPER_FEATURE))
+    else:
+        args.extend(("--package", PACKAGE))
     if target.system == "windows":
         # Ship no VC redistributable. Keep the GUI entry point and link the CRT.
         rustflags = f'target.{triple}.rustflags=["-Ctarget-feature=+crt-static"]'
         args.extend(("--config", rustflags))
-    return args, env
+    return args, env, build_dir / triple / "release"
 
 
-def _build(triple: str, target: Target) -> Path:
-    args, env = _cargo_build(triple, target)
+def _build(triple: str, target: Target) -> tuple[Path, Path | None]:
+    args, env, release = _cargo_build(triple, target)
+    if triple == WINDOWS_DYNAMIC_TARGET:
+        messages = _build_messages(args, env)
+        return release / f"{TAURI_DESKTOP}.exe", _find_windows_loader(
+            messages, release, target.arch
+        )
     subprocess.run(args, cwd=PROJECT, env=env, check=True)
-    name = f"{PACKAGE}.exe" if target.system == "windows" else PACKAGE
-    return PROJECT / "target" / triple / "release" / name
+    name = {
+        "macos": TAURI_DESKTOP,
+        "windows": f"{TAURI_DESKTOP}.exe",
+        "linux": PACKAGE,
+    }[target.system]
+    return release / name, None
 
 
 def _signed_macos_build(triple: str, target: Target) -> tuple[Path, Path]:
-    args, env = _cargo_build(triple, target)
-    args.extend((
-        "--features", MACOS_HELPER_FEATURE, "--message-format=json-render-diagnostics"
-    ))
-    result = subprocess.run(
-        args,
+    args, env, release = _cargo_build(triple, target, macos_helper=True)
+    return _find_macos_artifacts(_build_messages(args, env), release)
+
+
+def _build_messages(args: list[str], env: dict[str, str]) -> str:
+    return subprocess.run(
+        [*args, "--message-format=json-render-diagnostics"],
         cwd=PROJECT,
         env=env,
         check=True,
         stdout=subprocess.PIPE,
         encoding="utf-8",
-    )
-    return _find_macos_artifacts(result.stdout, PROJECT / "target" / triple / "release")
+    ).stdout
 
 
-def _find_macos_artifacts(messages: str, release: Path) -> tuple[Path, Path]:
-    gui_manifest = str(PROJECT / "crates" / PACKAGE / "Cargo.toml")
-    helper_manifest = str(MACOS_BACKEND / "Cargo.toml")
-    executables: set[Path] = set()
-    backend_ids: set[str] = set()
-    out_dirs: list[tuple[str, Path]] = []
+def _cargo_events(messages: str) -> Iterator[dict[str, object]]:
     for line in messages.splitlines():
         if not line.startswith("{"):
             continue
@@ -194,8 +233,50 @@ def _find_macos_artifacts(messages: str, release: Path) -> tuple[Path, Path]:
             message: object = json.loads(line)
         except json.JSONDecodeError as error:
             raise PackageError("Cargo returned an invalid artifact event.") from error
-        if not isinstance(message, dict):
-            continue
+        if isinstance(message, dict):
+            yield message
+
+
+def _find_windows_loader(messages: str, release: Path, arch: str) -> Path:
+    events = tuple(_cargo_events(messages))
+    package_ids: set[str] = set()
+    for event in events:
+        target = event.get("target")
+        package_id = event.get("package_id")
+        if (
+            event.get("reason") == "compiler-artifact"
+            and isinstance(target, dict)
+            and target.get("name") == "webview2_com_sys"
+            and target.get("kind") == ["lib"]
+            and isinstance(package_id, str)
+        ):
+            package_ids.add(package_id)
+    loaders: set[Path] = set()
+    build_root = (release / "build").resolve()
+    for event in events:
+        package_id = event.get("package_id")
+        out_dir = event.get("out_dir")
+        if (
+            event.get("reason") == "build-script-executed"
+            and isinstance(package_id, str)
+            and package_id in package_ids
+            and isinstance(out_dir, str)
+        ):
+            loader = (Path(out_dir) / arch / WINDOWS_LOADER_NAME).resolve()
+            if loader.is_relative_to(build_root):
+                loaders.add(loader)
+    if len(loaders) != 1:
+        raise PackageError("Cargo did not identify a unique WebView2 loader for the Windows target.")
+    return next(iter(loaders))
+
+
+def _find_macos_artifacts(messages: str, release: Path) -> tuple[Path, Path]:
+    gui_manifest = str(TAURI_MANIFEST)
+    helper_manifest = str(MACOS_BACKEND / "Cargo.toml")
+    executables: set[Path] = set()
+    backend_ids: set[str] = set()
+    out_dirs: list[tuple[str, Path]] = []
+    for message in _cargo_events(messages):
         reason: object = message.get("reason")
         package_id: object = message.get("package_id")
         if reason == "build-script-executed" and isinstance(package_id, str):
@@ -213,7 +294,7 @@ def _find_macos_artifacts(messages: str, release: Path) -> tuple[Path, Path]:
             executable: object = message.get("executable")
             if (
                 target.get("kind") == ["bin"]
-                and target.get("name") == PACKAGE
+                and target.get("name") == TAURI_DESKTOP
                 and isinstance(executable, str)
             ):
                 executables.add(Path(executable).resolve())
@@ -224,7 +305,7 @@ def _find_macos_artifacts(messages: str, release: Path) -> tuple[Path, Path]:
             and isinstance(package_id, str)
         ):
             backend_ids.add(package_id)
-    expected_gui = (release / PACKAGE).resolve()
+    expected_gui = (release / TAURI_DESKTOP).resolve()
     if executables != {expected_gui}:
         raise PackageError("Cargo did not report a GUI binary with helper support.")
     build_root = (release / "build").resolve()
@@ -247,7 +328,7 @@ def _read_at(source: BinaryIO, offset: int, size: int) -> bytes:
     return data
 
 
-def _validate_pe(source: BinaryIO, machine: int) -> None:
+def _read_pe_headers(source: BinaryIO, machine: int) -> tuple[bytes, int]:
     base = _read_at(source, 0, 64)
     if base[:2] != b"MZ":
         raise PackageError("Windows packaging requires a PE executable.")
@@ -262,16 +343,29 @@ def _validate_pe(source: BinaryIO, machine: int) -> None:
         actual != machine
         or not sections
         or not flags & IMAGE_EXECUTABLE
-        or flags & IMAGE_DLL
         or optional_size < 72
     ):
-        raise PackageError("Expected a Windows x64 application image.")
+        raise PackageError("Expected an executable Windows x64 PE image.")
     optional = _read_at(source, offset + len(header), optional_size)
     (kind,) = struct.unpack_from("<H", optional)
+    if kind != PE32_PLUS:
+        raise PackageError("Expected a PE32+ optional header.")
+    return optional, flags
+
+
+def _validate_pe(source: BinaryIO, machine: int) -> None:
+    optional, flags = _read_pe_headers(source, machine)
     (entry,) = struct.unpack_from("<I", optional, 16)
     (subsystem,) = struct.unpack_from("<H", optional, 68)
-    if kind != PE32_PLUS or not entry or subsystem != IMAGE_GUI:
+    if flags & IMAGE_DLL or not entry or subsystem != IMAGE_GUI:
         raise PackageError("Expected a Windows x64 GUI image with an entry point.")
+
+
+def _validate_windows_dll(source: BinaryIO, machine: int) -> None:
+    """Check the PE format, machine type and DLL characteristic."""
+    _, flags = _read_pe_headers(source, machine)
+    if not flags & IMAGE_DLL:
+        raise PackageError("Expected a Windows DLL image.")
 
 
 def _validate_macho(source: BinaryIO, machine: int) -> None:
@@ -537,15 +631,23 @@ def _package_members(
     target: Target,
     version: str,
     signing: MacSigning | None = None,
+    *,
+    windows_loader: Path | None = None,
+    windows_webview: bool = False,
 ) -> list[Member]:
     instructions = stage / "README.txt"
-    instructions.write_bytes((PROJECT / "scripts" / "release-readme.txt").read_bytes())
+    if windows_webview or windows_loader is not None:
+        instructions.write_bytes(WINDOWS_PORTABLE_README.encode("utf-8"))
+    else:
+        instructions.write_bytes((PROJECT / "scripts" / "release-readme.txt").read_bytes())
     members = [Member(instructions.name, instructions)]
     match target.system:
         case "macos":
             members.extend(_mac_app(binary, stage, version, target, signing))
         case "windows":
             members.append(Member(f"{APP_NAME}.exe", binary, PERM_EXECUTABLE))
+            if windows_loader is not None:
+                members.append(Member(WINDOWS_LOADER_NAME, windows_loader))
         case "linux":
             members.append(Member("uninstallany", binary, PERM_EXECUTABLE))
     return sorted(members, key=lambda member: member.name)
@@ -633,6 +735,9 @@ def _publish(
     version: str,
     output: Path,
     signing: MacSigning | None = None,
+    *,
+    windows_loader: Path | None = None,
+    windows_webview: bool = False,
 ) -> Path:
     stem = f"{APP_NAME}-{version}-{target.system}-{target.arch}"
     is_tar = target.system == "linux"
@@ -655,7 +760,21 @@ def _publish(
         staged_binary = stage / "binary"
         shutil.copyfile(binary, staged_binary)
         _validate_binary(staged_binary, target)
-        members = _package_members(staged_binary, stage, target, version, signing)
+        staged_loader: Path | None = None
+        if windows_loader is not None:
+            staged_loader = stage / WINDOWS_LOADER_NAME
+            shutil.copyfile(windows_loader, staged_loader)
+            with staged_loader.open("rb") as source:
+                _validate_windows_dll(source, target.machine)
+        members = _package_members(
+            staged_binary,
+            stage,
+            target,
+            version,
+            signing,
+            windows_loader=staged_loader,
+            windows_webview=windows_webview,
+        )
         if is_tar:
             _write_tar(archive, members)
         else:
@@ -678,6 +797,11 @@ def main() -> int:
     parser.add_argument("--target", choices=TARGETS)
     parser.add_argument(
         "--binary", type=Path, help="package a trusted prebuilt release binary"
+    )
+    parser.add_argument(
+        "--windows-loader",
+        type=Path,
+        help="trusted WebView2Loader.dll for a prebuilt Windows binary that imports it",
     )
     parser.add_argument("--output-dir", type=Path, default=PROJECT / "target" / "dist")
     parser.add_argument(
@@ -702,6 +826,11 @@ def main() -> int:
         supplied_helper: Path | None = args.macos_helper_binary
         notary_profile: str | None = args.macos_notary_profile
         binary_input: Path | None = args.binary
+        windows_loader: Path | None = args.windows_loader
+        if windows_loader is not None and (
+            target.system != "windows" or binary_input is None
+        ):
+            raise PackageError("--windows-loader requires a Windows target and --binary.")
         if identity is not None:
             if target.system != "macos" or identity.strip() in ("", "-"):
                 raise PackageError("Helper releases require a macOS Developer ID identity.")
@@ -721,9 +850,20 @@ def main() -> int:
                 raise PackageError(
                     "Helper binaries and notarization require --macos-signing-identity."
                 )
-            binary = binary_input.resolve() if binary_input else _build(triple, target)
+            if binary_input is None:
+                binary, windows_loader = _build(triple, target)
+            else:
+                binary = binary_input.resolve()
         output = args.output_dir.resolve()
-        archive = _publish(binary, target, _project_version(), output, signing)
+        archive = _publish(
+            binary,
+            target,
+            _project_version(),
+            output,
+            signing,
+            windows_loader=windows_loader,
+            windows_webview=target.system == "windows" and binary_input is None,
+        )
     except (OSError, PackageError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Packaging failed: {error}\n")
     print(f"{archive} ({archive.stat().st_size:,} bytes)")

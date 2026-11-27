@@ -21,6 +21,15 @@ pub struct Inspection {
 /// Writes both the public .reg file and the private typed restoration snapshot.
 pub type RegistryBackupWriter<'a> = dyn FnMut(&[u8], &[u8]) -> io::Result<()> + 'a;
 
+/// The latest change proven by a receipt committed with a registry operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistryChangeReceipt {
+    /// The exact backed-up object was removed.
+    Applied,
+    /// The exact backup was restored and may no longer be applied.
+    Restored,
+}
+
 /// Filesystem operations whose implementations revalidate identity at mutation.
 pub trait FileStore {
     /// Reopens the exact target without following links.
@@ -52,6 +61,13 @@ pub trait FileStore {
         _slot: Uuid,
     ) -> io::Result<Option<PathBuf>> {
         Ok(None)
+    }
+    /// Identifies a recorded file that needs another file to be restored first.
+    ///
+    /// The engine also uses this order in reverse when quarantining startup
+    /// files. Classify the recorded path and fingerprint without inspecting disk.
+    fn restore_file_after_ordinary_files(&self, _path: &Path, _expected: &str) -> bool {
+        false
     }
     /// Restores the verified object without overwriting anything at the destination.
     fn restore_file(&self, path: &Path, expected: &str, slot: Uuid) -> io::Result<()>;
@@ -102,6 +118,47 @@ pub trait RegistryStore {
     ) -> io::Result<()>;
     /// Restores only the supplied target from the typed snapshot without replacing a conflict.
     fn restore_registry(&self, target: &RegistryTarget, snapshot: &[u8]) -> io::Result<()>;
+
+    /// Removes the target and can commit a receipt in the same transaction.
+    ///
+    /// A native receipt must bind the operation ID, exact target and typed
+    /// backup snapshot. It may only be published after the backup writer succeeds.
+    fn remove_registry_with_receipt(
+        &self,
+        target: &RegistryTarget,
+        expected: &str,
+        _operation_id: Uuid,
+        write: &mut RegistryBackupWriter<'_>,
+    ) -> io::Result<()> {
+        self.remove_registry(target, expected, write)
+    }
+
+    /// Restores a target and can commit a terminal receipt in the same transaction.
+    ///
+    /// An existing terminal receipt must prevent a duplicate restore. A native
+    /// receipt may be absent for a legacy backup with a valid journal receipt.
+    fn restore_registry_with_receipt(
+        &self,
+        target: &RegistryTarget,
+        snapshot: &[u8],
+        _operation_id: Uuid,
+    ) -> io::Result<()> {
+        self.restore_registry(target, snapshot)
+    }
+
+    /// Reads the exact native receipt without changing the target or journal.
+    ///
+    /// Match the operation ID, target and snapshot. Use `None` only if there
+    /// is no receipt. Return an error for conflicting or unreadable evidence.
+    /// Target presence, absence or matching contents cannot prove a commit.
+    fn registry_change_receipt(
+        &self,
+        _target: &RegistryTarget,
+        _snapshot: &[u8],
+        _operation_id: Uuid,
+    ) -> io::Result<Option<RegistryChangeReceipt>> {
+        Ok(None)
+    }
 }
 
 /// Supplemental verification held in memory from uninstall through file cleanup.
@@ -118,7 +175,7 @@ pub struct OfficialExecution {
     /// An unverified result may include this evidence once the command has
     /// exited. Leave it empty if waiting was interrupted or cancelled.
     pub read_only_residuals: Vec<Proposal>,
-    /// Exact file fingerprints observed while the original app was present.
+    /// Exact filesystem fingerprints observed while the original app was present.
     ///
     /// These are attribution evidence for a fresh scan after verified
     /// completion. They never authorize a write by themselves.
@@ -156,6 +213,14 @@ pub trait PlatformBackend: FileStore + RegistryStore {
     /// Opaque prepared native command that is kept in memory through confirmation.
     type Official;
 
+    /// Acquires the platform's guard for a confirmed mutation.
+    ///
+    /// The engine holds it through fresh preflight checks, writes and their
+    /// outcome audit. The default only checks cancellation.
+    fn begin_mutation(&self, cancel: &Cancellation) -> Result<impl Sized> {
+        cancel.check()
+    }
+
     /// Reads application inventory and source warnings.
     fn inventory(&self, cancel: &Cancellation) -> Result<Inventory>;
     /// Reads the current record for one exact identity from its inventory source.
@@ -190,6 +255,39 @@ pub trait PlatformBackend: FileStore + RegistryStore {
     ) -> Result<Scan> {
         self.scan(app, mode, cancel)
     }
+    /// Revalidates scan-bound force-removal evidence before each approved write.
+    fn check_force_removal_binding(
+        &self,
+        _app: &AppId,
+        _binding: &str,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        cancel.check()
+    }
+    /// Revalidates force-removal evidence for a file immediately before isolation.
+    ///
+    /// The default uses the same binding check as registry writes. Platforms
+    /// can also recheck attribution that depends on the specific file.
+    fn check_force_removal_file(
+        &self,
+        app: &AppId,
+        binding: &str,
+        _path: &Path,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        self.check_force_removal_binding(app, binding, cancel)
+    }
+    /// Rechecks application ownership after backup and before a registry write.
+    /// Implementations must only read because the backend can hold a transaction.
+    fn check_registry_cleanup_application(
+        &self,
+        _app: &AppId,
+        _mode: ScanMode,
+        _target: &RegistryTarget,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        cancel.check()
+    }
     /// Scans the independently verified former installation with native evidence.
     fn scan_after_official_uninstall(
         &self,
@@ -204,6 +302,34 @@ pub trait PlatformBackend: FileStore + RegistryStore {
                 self.scan_for_cleanup_recheck(app, ScanMode::AfterOfficialUninstall, cancel)
             }
         }
+    }
+    /// Rejects leftover cleanup when a related installation has appeared.
+    /// This does not change the separately verified outcome of the uninstall.
+    fn check_cleanup_after_uninstall(&self, _app: &AppRecord, cancel: &Cancellation) -> Result<()> {
+        cancel.check()
+    }
+    /// Revalidates native observations that authorize leftover cleanup only.
+    fn check_cleanup_observations(
+        &self,
+        _app: &AppRecord,
+        _observed_files: &HashMap<PathBuf, String>,
+        _cancel: &Cancellation,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Revalidates a marked file after staging its backup intent.
+    /// The engine holds the returned guard through quarantine.
+    fn pin_post_uninstall_file(
+        &self,
+        _app: &AppRecord,
+        _path: &Path,
+        _observed_files: &HashMap<PathBuf, String>,
+        cancel: &Cancellation,
+    ) -> Result<impl Sized> {
+        cancel.check()?;
+        Err::<(), _>(crate::Error::Rejected(
+            "the required post-uninstall file guard is unavailable on this platform".into(),
+        ))
     }
     /// Finds residual objects in an explicitly selected portable application location.
     fn scan_portable(&self, directory: &Path, cancel: &Cancellation) -> Result<Scan>;
@@ -276,6 +402,9 @@ pub trait PlatformBackend: FileStore + RegistryStore {
             post_uninstall_check: None,
         })
     }
+    /// Records a native official outcome after the core has saved its audit event.
+    fn record_audited_official_outcome(&self, _app: &AppRecord, _outcome: &OfficialOutcome) {}
+
     /// Completes bounded read-only verification after a native command reports completion.
     /// Opting in keeps a late cancellation from interrupting that verification.
     fn verify_finished_official_after_cancel(&self) -> bool {

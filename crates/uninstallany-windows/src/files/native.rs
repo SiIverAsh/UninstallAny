@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_OFFLINE,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY,
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_BASIC_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
@@ -163,7 +163,7 @@ fn reserved_name(part: &[u16]) -> bool {
     )
 }
 
-pub(super) fn equal_name(left: &OsStr, right: &OsStr) -> bool {
+pub(crate) fn equal_name(left: &OsStr, right: &OsStr) -> bool {
     let (left, right) = (wide(left), wide(right));
     // SAFETY: Both buffers remain live and their explicit lengths are bounded by MAX_PATH_UNITS.
     unsafe {
@@ -185,6 +185,25 @@ pub(crate) fn open(path: &LocalPath, access: u32, share: u32) -> io::Result<Open
     match walk(path, access, share)? {
         PathWalk::Present(path) => Ok(path),
         PathWalk::Missing { error, .. } => Err(error),
+    }
+}
+
+/// Resolves a registered address without following links, preserving any missing suffix.
+pub(crate) fn canonical_claim_path(path: &Path) -> io::Result<PathBuf> {
+    let requested = LocalPath::parse(path)?;
+    match walk(&requested, 0, SHARE_DIRECTORY)? {
+        PathWalk::Present(opened) => Ok(canonical(opened.leaf())?.as_path()),
+        PathWalk::Missing { parent, .. } => {
+            let mut resolved_parent = canonical(parent.leaf())?;
+            let reached_depth = parent.handles().len() - 1;
+            if resolved_parent.depth() != reached_depth {
+                return Err(denied("registered path crosses an ambiguous ancestor"));
+            }
+            resolved_parent
+                .components
+                .extend_from_slice(&requested.components[reached_depth..]);
+            Ok(resolved_parent.as_path())
+        }
     }
 }
 
@@ -341,11 +360,11 @@ impl OpenPath {
         Ok(())
     }
 
-    pub(super) fn parent_id(&self) -> io::Result<Option<Identity>> {
-        if self.handles.len() < 2 {
-            return Ok(None);
-        }
-        identity(&self.handles[self.handles.len() - 2]).map(Some)
+    pub(super) fn ancestor_ids(&self) -> io::Result<Vec<Identity>> {
+        self.handles[..self.handles.len() - 1]
+            .iter()
+            .map(identity)
+            .collect()
     }
 }
 
@@ -464,6 +483,23 @@ pub(crate) fn identity(handle: &OwnedHandle) -> io::Result<Identity> {
     })
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct DirectoryIdentity {
+    file: Identity,
+    creation_time: i64,
+}
+
+pub(crate) fn directory_identity(handle: &OwnedHandle) -> io::Result<DirectoryIdentity> {
+    require_directory(handle)?;
+    // Normal removal changes directory write times, while creation time helps
+    // distinguish identity reuse after the original directory was deleted.
+    let basics: FILE_BASIC_INFO = information(handle, FileBasicInfo)?;
+    Ok(DirectoryIdentity {
+        file: identity(handle)?,
+        creation_time: basics.CreationTime,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Metadata {
     pub(super) identity: Identity,
@@ -479,7 +515,11 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
-    pub(super) fn is_single_local_file(&self) -> bool {
+    pub(super) fn is_read_only(&self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_READONLY != 0
+    }
+
+    pub(crate) fn is_single_local_file(&self) -> bool {
         // Data marked for recall must never be read by the offline scanner.
         self.attributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) == 0
             && !self.is_directory
@@ -626,7 +666,7 @@ pub(super) fn canonical(handle: &OwnedHandle) -> io::Result<LocalPath> {
 }
 
 pub(super) fn rename(
-    source: &OwnedHandle,
+    source: &impl AsRawHandle,
     destination: &OwnedHandle,
     name: &OsStr,
 ) -> io::Result<()> {
@@ -657,7 +697,7 @@ pub(super) fn rename(
             .cast::<u16>()
             .copy_from_nonoverlapping(name.as_ptr(), name.len());
         NtSetInformationFile(
-            raw(source),
+            source.as_raw_handle(),
             &mut io_status,
             bytes.cast(),
             length,
@@ -678,13 +718,13 @@ pub(super) const SCAN_DIRECTORY: u32 = FILE_LIST_DIRECTORY | FILE_TRAVERSE;
 pub(super) const EXISTING_FILE: u32 = FILE_NON_DIRECTORY_FILE;
 pub(super) const EXISTING_DIRECTORY: u32 = FILE_DIRECTORY_FILE;
 
-pub(super) fn delete_checked_handle(handle: &OwnedHandle) -> io::Result<()> {
+pub(super) fn delete_checked_handle(handle: &impl AsRawHandle) -> io::Result<()> {
     let information = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: The buffer lives through the call and describes file disposition.
     // The caller supplies a DELETE handle opened on the checked, non-directory object.
     let success = unsafe {
         SetFileInformationByHandle(
-            raw(handle),
+            handle.as_raw_handle(),
             FileDispositionInfo,
             (&information as *const FILE_DISPOSITION_INFO).cast(),
             size_of::<FILE_DISPOSITION_INFO>() as u32,

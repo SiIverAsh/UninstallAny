@@ -1,29 +1,40 @@
+use std::ffi::c_void;
 use std::io;
-use std::mem::{size_of, size_of_val};
+use std::mem::{offset_of, size_of, size_of_val};
 use std::ptr::{null, null_mut};
 
 use uninstallany_core::{RegistryHive, RegistryTarget, RegistryView};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows_sys::Wdk::System::Registry::{NtCreateKeyTransacted, NtOpenKeyTransactedEx};
+use windows_sys::Wdk::System::Registry::{
+    NtCreateKey, NtCreateKeyTransacted, NtOpenKeyEx, NtOpenKeyTransactedEx,
+};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
     ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
-    OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError, UNICODE_STRING,
+    OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError, STATUS_OBJECT_NAME_NOT_FOUND,
+    UNICODE_STRING,
 };
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_REGISTRY_KEY,
+};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, IsValidSecurityDescriptor, OBJECT_SECURITY_INFORMATION, TOKEN_QUERY,
-    TOKEN_USER, TokenUser,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation,
+    DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+    GetTokenInformation, IsValidSecurityDescriptor, OBJECT_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CommitTransaction, CreateTransaction, RollbackTransaction,
+    CommitTransaction, CreateTransaction, READ_CONTROL, RollbackTransaction,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_WOW64_32KEY,
-    KEY_WOW64_64KEY, REG_CREATED_NEW_KEY, REG_OPTION_NON_VOLATILE, REG_OPTION_OPEN_LINK,
-    RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegGetKeySecurity, RegOpenCurrentUser,
-    RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_ALL_ACCESS, KEY_CREATE_SUB_KEY,
+    KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+    REG_CREATED_NEW_KEY, REG_OPTION_NON_VOLATILE, REG_OPTION_OPEN_LINK, REG_OPTION_VOLATILE,
+    RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegGetKeySecurity, RegOpenKeyExW, RegQueryInfoKeyW,
+    RegQueryValueExW,
 };
+use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::format::RawValue;
@@ -34,6 +45,9 @@ const MAX_REGISTRY_VALUE_BYTES: u32 = 1_048_576;
 const MAX_KEY_ENTRIES: u32 = 32_768;
 const MAX_SECURITY_BYTES: u32 = 262_144;
 const TRANSACTION_TIMEOUT_MS: u32 = 30_000;
+const RECOVERY_KEY: &str = "UninstallAny.RegistryRecovery";
+const RECOVERY_KEY_READ: u32 = READ_CONTROL | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 
 pub(super) struct Key(pub HKEY);
 
@@ -50,6 +64,15 @@ impl Drop for Handle {
     fn drop(&mut self) {
         // SAFETY: Handle owns a live kernel handle returned by a successful call.
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+struct LocalAllocation(*mut c_void);
+
+impl Drop for LocalAllocation {
+    fn drop(&mut self) {
+        // SAFETY: This owns only memory returned by APIs specifying LocalFree.
+        unsafe { LocalFree(self.0) };
     }
 }
 
@@ -160,13 +183,7 @@ pub(super) fn open(
     let view = view_flags(target.view);
     let inspect = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
     let mut current = match target.hive {
-        RegistryHive::CurrentUser => {
-            let mut user = null_mut();
-            // SAFETY: The out pointer is valid. RegOpenCurrentUser returns an
-            // owned HKEY scoped to the current process user in this backend.
-            status(unsafe { RegOpenCurrentUser(inspect, &mut user) })?;
-            Some(Key(user))
-        }
+        RegistryHive::CurrentUser => Some(open_user_hive(&user_sid()?)?),
         RegistryHive::LocalMachine => None,
     };
     while let Some(part) = parts.next() {
@@ -246,6 +263,267 @@ fn attributes(parent: HKEY, name: &UNICODE_STRING) -> OBJECT_ATTRIBUTES {
     }
 }
 
+pub(super) fn open_launch_parent(access: u32) -> io::Result<Key> {
+    let inspect = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+    // HKCU Software is shared between WOW64 views. Open the SID explicitly
+    // because RegOpenCurrentUser can use the default hive if it is unloaded.
+    let user = open_child(HKEY_USERS, &user_sid()?, inspect, None)?;
+    if query(&user, "SymbolicLinkValue")?.is_some() {
+        return Err(invalid("the current user hive is a registry alias"));
+    }
+    let software = open_relative_leaf(&user, "Software", access | inspect)?
+        .ok_or_else(|| invalid("the current user Software key is missing"))?;
+    if query(&software, "SymbolicLinkValue")?.is_some() {
+        return Err(invalid("the current user Software key is a registry alias"));
+    }
+    Ok(software)
+}
+
+pub(super) fn open_relative_leaf(parent: &Key, leaf: &str, access: u32) -> io::Result<Option<Key>> {
+    let mut words = leaf_name(leaf)?;
+    let name = unicode(&mut words);
+    let attributes = attributes(parent.0, &name);
+    open_native_key(&attributes, access, None)
+}
+
+fn open_native_key(
+    attributes: &OBJECT_ATTRIBUTES,
+    access: u32,
+    transaction: Option<&Transaction>,
+) -> io::Result<Option<Key>> {
+    let mut opened = null_mut();
+    // SAFETY: The validated name, optional handles and output remain live.
+    // Open the link itself if this address names a registry symbolic link.
+    let status = unsafe {
+        match transaction {
+            Some(transaction) => NtOpenKeyTransactedEx(
+                &mut opened,
+                access,
+                attributes,
+                REG_OPTION_OPEN_LINK,
+                transaction.handle.0,
+            ),
+            None => NtOpenKeyEx(&mut opened, access, attributes, REG_OPTION_OPEN_LINK),
+        }
+    };
+    if status == STATUS_OBJECT_NAME_NOT_FOUND {
+        return Ok(None);
+    }
+    ntstatus(status)?;
+    Ok(Some(Key(opened)))
+}
+
+/// Opens the private receipt key for lookup, or for writing in the given transaction.
+pub(super) fn open_recovery_key(transaction: Option<&Transaction>) -> io::Result<Option<Key>> {
+    let user = user_sid()?;
+    let parent = open_recovery_parent(&user, 0)?;
+    let mut words = leaf_name(RECOVERY_KEY)?;
+    let name = unicode(&mut words);
+    let attributes = attributes(parent.0, &name);
+    let access = RECOVERY_KEY_READ | transaction.map_or(0, |_| KEY_SET_VALUE);
+    let Some(key) = open_native_key(&attributes, access, transaction)? else {
+        return Ok(None);
+    };
+    verify_recovery_key(&key, &user)?;
+    Ok(Some(key))
+}
+
+/// Ensures a protected receipt key exists before starting an approved target transaction.
+pub(super) fn ensure_recovery_key() -> io::Result<()> {
+    let user = user_sid()?;
+    let parent = open_recovery_parent(&user, KEY_CREATE_SUB_KEY)?;
+    let sddl = wide(&format!("O:{user}D:P(A;;KA;;;{user})(A;;KA;;;SY)"));
+    let mut descriptor = null_mut();
+    // SAFETY: The SDDL input is terminated and the descriptor out pointer is writable.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let descriptor = LocalAllocation(descriptor);
+    let mut words = leaf_name(RECOVERY_KEY)?;
+    let name = unicode(&mut words);
+    let mut attributes = attributes(parent.0, &name);
+    attributes.SecurityDescriptor = descriptor.0.cast();
+    let mut opened = null_mut();
+    // SAFETY: The parent and all buffers stay live through the relative create.
+    // Windows applies creation options only to a newly created key. An existing
+    // key must pass the same validation and is never reconfigured here.
+    ntstatus(unsafe {
+        NtCreateKey(
+            &mut opened,
+            RECOVERY_KEY_READ,
+            &attributes,
+            0,
+            null(),
+            REG_OPTION_NON_VOLATILE,
+            null_mut(),
+        )
+    })?;
+    verify_recovery_key(&Key(opened), &user)
+}
+
+fn open_user_hive(user: &str) -> io::Result<Key> {
+    let inspect = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+    // This is the supplied process SID in the kernel HKU namespace. A missing
+    // hive is an error and cannot fall back to the default profile.
+    let mut words = wide(&format!(r"\Registry\User\{user}"));
+    let name = unicode(&mut words);
+    let attributes = attributes(null_mut(), &name);
+    let user = open_native_key(&attributes, inspect, None)?
+        .ok_or_else(|| invalid("the process user registry hive is missing"))?;
+    if query(&user, "SymbolicLinkValue")?.is_some() {
+        return Err(invalid("the process user registry hive is an alias"));
+    }
+    Ok(user)
+}
+
+fn open_recovery_parent(user: &str, access: u32) -> io::Result<Key> {
+    let inspect = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+    let user = open_user_hive(user)?;
+    let software = open_relative_leaf(&user, "Software", access | inspect)?
+        .ok_or_else(|| invalid("the process user Software key is missing"))?;
+    if query(&software, "SymbolicLinkValue")?.is_some() {
+        return Err(invalid("the registry recovery parent is an alias"));
+    }
+    Ok(software)
+}
+
+fn verify_recovery_key(key: &Key, user: &str) -> io::Result<()> {
+    let info = key_info(key)?;
+    if info.subkeys != 0 || !info.class.is_empty() || query(key, "SymbolicLinkValue")?.is_some() {
+        return Err(invalid("the registry recovery key is not a plain leaf"));
+    }
+    let (mut owner, mut acl, mut descriptor) = (null_mut(), null_mut(), null_mut());
+    // SAFETY: The opened key remains live and the requested outputs are writable.
+    let result = unsafe {
+        GetSecurityInfo(
+            key.0,
+            SE_REGISTRY_KEY,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut acl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    status(result)?;
+    let descriptor = LocalAllocation(descriptor);
+    if owner.is_null() || acl.is_null() || descriptor.0.is_null() || sid_string(owner)? != user {
+        return Err(invalid(
+            "the registry recovery key has an unexpected owner or ACL",
+        ));
+    }
+    let (mut control, mut revision) = (0, 0);
+    // SAFETY: The Windows-owned descriptor remains live and outputs are writable.
+    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if control & SE_DACL_PROTECTED == 0 {
+        return Err(invalid("the registry recovery key inherits permissions"));
+    }
+    let mut expected = [Some(user), Some(LOCAL_SYSTEM_SID)];
+    let mut info = ACL_SIZE_INFORMATION::default();
+    // SAFETY: The ACL is owned by the descriptor and the output matches the class.
+    if unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if info.AceCount != expected.len() as u32 {
+        return Err(invalid("the registry recovery key has an unexpected ACL"));
+    }
+    for index in 0..info.AceCount {
+        let mut entry = null_mut();
+        // SAFETY: The index is bounded by the ACL information and the output is writable.
+        if unsafe { GetAce(acl, index, &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: An ACE returned by Windows starts with a live ACE_HEADER.
+        let header = unsafe { &*entry.cast::<ACE_HEADER>() };
+        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
+            || header.AceFlags != 0
+            || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
+        {
+            return Err(invalid("the registry recovery key has an unexpected ACE"));
+        }
+        // SAFETY: We checked the ACE kind and size before reading its allowed fields.
+        let mask = unsafe { (*entry.cast::<ACCESS_ALLOWED_ACE>()).Mask };
+        if mask != KEY_ALL_ACCESS {
+            return Err(invalid(
+                "the registry recovery key has unexpected access rights",
+            ));
+        }
+        // SAFETY: SidStart marks the contained SID of the validated allow ACE.
+        let sid = unsafe {
+            entry
+                .cast::<u8>()
+                .add(offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                .cast()
+        };
+        let principal = sid_string(sid)?;
+        let Some(expected) = expected
+            .iter_mut()
+            .find(|candidate| **candidate == Some(principal.as_str()))
+        else {
+            return Err(invalid(
+                "the registry recovery key grants unexpected access",
+            ));
+        };
+        *expected = None;
+    }
+    Ok(())
+}
+
+pub(super) fn create_volatile_leaf(parent: &Key, leaf: &str, access: u32) -> io::Result<Key> {
+    let mut words = leaf_name(leaf)?;
+    let name = unicode(&mut words);
+    let attributes = attributes(parent.0, &name);
+    let mut opened = null_mut();
+    let mut disposition = 0;
+    // SAFETY: The single-component name and output pointers remain live.
+    // The relative parent is already open and OBJ_DONT_REPARSE rejects links.
+    ntstatus(unsafe {
+        NtCreateKey(
+            &mut opened,
+            access,
+            &attributes,
+            0,
+            null(),
+            REG_OPTION_VOLATILE,
+            &mut disposition,
+        )
+    })?;
+    let key = Key(opened);
+    if disposition != REG_CREATED_NEW_KEY {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a Windows uninstall launch marker already exists",
+        ));
+    }
+    Ok(key)
+}
+
+fn leaf_name(leaf: &str) -> io::Result<Vec<u16>> {
+    if path_components(leaf)?.count() != 1 {
+        return Err(invalid("expected a single relative registry key component"));
+    }
+    Ok(wide(leaf))
+}
+
 pub(super) fn create_leaf(
     parent: &Key,
     path: &str,
@@ -294,6 +572,7 @@ pub(super) fn create_leaf(
 pub(super) struct KeyInfo {
     pub class: Vec<u16>,
     pub subkeys: u32,
+    pub values: u32,
     pub modified: u64,
 }
 
@@ -301,6 +580,7 @@ pub(super) fn key_info(key: &Key) -> io::Result<KeyInfo> {
     let mut class = [0; MAX_KEY_NAME_WIDE + 1];
     let mut class_size = class.len() as u32;
     let mut subkeys = 0;
+    let mut values = 0;
     let mut modified = FILETIME::default();
     // SAFETY: The output arguments are valid for the requested sizes.
     status(unsafe {
@@ -312,7 +592,7 @@ pub(super) fn key_info(key: &Key) -> io::Result<KeyInfo> {
             &mut subkeys,
             null_mut(),
             null_mut(),
-            null_mut(),
+            &mut values,
             null_mut(),
             null_mut(),
             null_mut(),
@@ -322,14 +602,22 @@ pub(super) fn key_info(key: &Key) -> io::Result<KeyInfo> {
     Ok(KeyInfo {
         class: class[..class_size as usize].to_vec(),
         subkeys,
+        values,
         modified: u64::from(modified.dwHighDateTime) << 32 | u64::from(modified.dwLowDateTime),
     })
 }
 
 pub(super) fn subkeys(key: &Key) -> io::Result<Vec<String>> {
+    // One of the existing enumeration calls is reserved to detect the end.
+    subkeys_with_limit(key, MAX_KEY_ENTRIES - 1)
+}
+
+/// Reads every child name up to the given count, rejecting incomplete results.
+pub(super) fn subkeys_with_limit(key: &Key, limit: u32) -> io::Result<Vec<String>> {
+    let limit = limit.min(MAX_KEY_ENTRIES - 1);
     let mut names = Vec::new();
     let mut name = [0; MAX_KEY_NAME_WIDE + 1];
-    for index in 0..MAX_KEY_ENTRIES {
+    for index in 0..=limit {
         let mut name_size = name.len() as u32;
         // SAFETY: The wide buffer length matches the input capacity. All
         // optional outputs are null and reserved is null.
@@ -349,15 +637,24 @@ pub(super) fn subkeys(key: &Key) -> io::Result<Vec<String>> {
             return Ok(names);
         }
         status(code)?;
+        if index == limit {
+            break;
+        }
         names.push(String::from_utf16(&name[..name_size as usize]).map_err(io::Error::other)?);
     }
     Err(invalid("too many registry subkeys to verify"))
 }
 
 pub(super) fn value_names(key: &Key) -> io::Result<Vec<String>> {
+    value_names_with_limit(key, MAX_KEY_ENTRIES - 1)
+}
+
+/// Reads every value name up to the given count, rejecting incomplete results.
+pub(super) fn value_names_with_limit(key: &Key, limit: u32) -> io::Result<Vec<String>> {
+    let limit = limit.min(MAX_KEY_ENTRIES - 1);
     let mut names = Vec::new();
     let mut name = vec![0; MAX_VALUE_NAME_WIDE + 1];
-    for index in 0..MAX_KEY_ENTRIES {
+    for index in 0..=limit {
         let mut name_size = name.len() as u32;
         // SAFETY: The wide buffer length matches the input capacity. The
         // remaining outputs are optional and not requested.
@@ -377,6 +674,9 @@ pub(super) fn value_names(key: &Key) -> io::Result<Vec<String>> {
             return Ok(names);
         }
         status(code)?;
+        if index == limit {
+            break;
+        }
         names.push(String::from_utf16(&name[..name_size as usize]).map_err(io::Error::other)?);
     }
     Err(invalid("too many registry values to verify"))
@@ -519,11 +819,15 @@ pub(super) fn user_sid() -> io::Result<String> {
     {
         return Err(io::Error::last_os_error());
     }
-    let mut text = null_mut();
     // SAFETY: The successful TokenUser query wrote a TOKEN_USER in the buffer
     // followed by the SID that its User.Sid points to.
     let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    // SAFETY: sid is from the live token buffer and text is an out pointer.
+    sid_string(sid)
+}
+
+fn sid_string(sid: PSID) -> io::Result<String> {
+    let mut text = null_mut();
+    // SAFETY: The SID belongs to a live Windows response and text is writable.
     if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
         return Err(io::Error::last_os_error());
     }
