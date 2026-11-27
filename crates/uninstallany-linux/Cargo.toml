@@ -4,9 +4,21 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+dpkg-helper = []
+
+[[bin]]
+name = "uninstallany-dpkg-helper"
+path = "src/bin/dpkg_helper.rs"
+required-features = ["dpkg-helper"]
+
 [target.'cfg(unix)'.dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-rustix = { version = "1.1", features = ["process"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
+serde_json.workspace = true
 uninstallany-core = { path = "../uninstallany-core" }
 uninstallany-unix = { path = "../uninstallany-unix" }
 uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.4", default-features = false, features = ["fs"] }

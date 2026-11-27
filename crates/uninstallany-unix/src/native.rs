@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 mod directory_expiry;
 #[cfg(target_os = "macos")]
 pub(super) use directory_expiry::{DirectoryExpiryFingerprint, DirectoryExpiryTree, require_apfs};
+#[cfg(target_os = "linux")]
+mod flatpak_tree;
+#[cfg(target_os = "linux")]
+pub(super) use flatpak_tree::stamp as flatpak_tree_stamp;
 
 const MIN_PW_BUFFER: usize = 1024;
 const MAX_PW_BUFFER: usize = 1024 * 1024;
@@ -27,7 +31,7 @@ pub(super) const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(super) struct NodeId {
     pub(super) device: u64,
-    inode: u64,
+    pub(super) inode: u64,
     pub(super) mount: u64,
 }
 
@@ -218,6 +222,8 @@ pub(super) fn checked_file(parent: &OwnedFd, name: &OsStr) -> io::Result<File> {
 #[cfg(target_os = "macos")]
 pub(super) use application::cache_directory_stamp;
 #[cfg(target_os = "macos")]
+pub(super) use application::cask_staging_stamp;
+#[cfg(target_os = "macos")]
 pub(super) use application::http_storage_directory_stamp;
 #[cfg(target_os = "macos")]
 pub(super) use application::stamp as application_stamp;
@@ -243,10 +249,11 @@ mod application {
     pub(super) const MAX_DEPTH: usize = 48;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
-    pub(super) enum Tree {
+    pub(super) enum Tree<'a> {
         Bundle,
         Cache,
         HttpStorage,
+        CaskStaging(&'a OsStr),
     }
 
     pub(crate) fn stamp(parent: &OwnedFd, name: &OsStr, uid: u32) -> io::Result<[u8; 32]> {
@@ -287,6 +294,15 @@ mod application {
         directory_stamp(parent, name, uid, Tree::Cache)
     }
 
+    pub(crate) fn cask_staging_stamp(
+        parent: &OwnedFd,
+        name: &OsStr,
+        staged_app: &OsStr,
+        uid: u32,
+    ) -> io::Result<[u8; 32]> {
+        directory_stamp(parent, name, uid, Tree::CaskStaging(staged_app))
+    }
+
     pub(crate) fn http_storage_directory_stamp(
         parent: &OwnedFd,
         name: &OsStr,
@@ -299,7 +315,7 @@ mod application {
         parent: &OwnedFd,
         name: &OsStr,
         uid: u32,
-        tree: Tree,
+        tree: Tree<'_>,
     ) -> io::Result<[u8; 32]> {
         let directory = open_subdirectory(parent, name)?;
         let opened = EntryStamp::from_stat(&fs::fstat(&directory)?);
@@ -321,6 +337,10 @@ mod application {
                 HTTP_STORAGE_FILES.len(),
                 "the HTTP storage directory changed during verification",
             ),
+            Tree::CaskStaging(_) => (
+                MAX_CACHE_ENTRIES,
+                "the cask's staging directory changed during verification",
+            ),
         };
         hash_contents(&directory, &mut digest, &mut remaining, uid, 0, tree)?;
         if opened != EntryStamp::from_stat(&entry_stat(parent, name)?) {
@@ -335,7 +355,7 @@ mod application {
         remaining: &mut usize,
         uid: u32,
         depth: usize,
-        tree: Tree,
+        tree: Tree<'_>,
     ) -> io::Result<()> {
         if depth >= MAX_DEPTH {
             return Err(deny("the directory tree exceeds the discovery depth limit"));
@@ -375,7 +395,9 @@ mod application {
             feed_tree_entry(digest, &name, depth, &entry)?;
             match kind {
                 FileType::Directory if tree != Tree::HttpStorage => {
-                    if tree == Tree::Cache && crate::is_bundle_name(Path::new(&name)) {
+                    if matches!(tree, Tree::Cache | Tree::CaskStaging(_))
+                        && crate::is_bundle_name(Path::new(&name))
+                    {
                         return Err(deny(
                             "the cache tree contains an independent application bundle",
                         ));
@@ -400,7 +422,11 @@ mod application {
                     }
                 }
                 FileType::Symlink
-                    if tree == Tree::Bundle && stat.st_uid == uid && stat.st_nlink == 1 => {}
+                    if stat.st_uid == uid
+                        && stat.st_nlink == 1
+                        && (tree == Tree::Bundle
+                            || matches!(tree, Tree::CaskStaging(app) if depth == 0 && name.as_os_str() == app)) =>
+                    {}
                 _ => {
                     return Err(deny(
                         "the directory tree contains a shared or unsupported object",

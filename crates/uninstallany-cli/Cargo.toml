@@ -1,0 +1,24 @@
+[package]
+name = "uninstallany-cli"
+description = "Command-line interface for UninstallAny"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "uninstallany"
+path = "src/main.rs"
+
+[dependencies]
+uuid.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+ctrlc = "=3.5.2"
+uninstallany-core = { path = "../uninstallany-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+uninstallany-macos = { path = "../uninstallany-macos" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+uninstallany-linux = { path = "../uninstallany-linux" }

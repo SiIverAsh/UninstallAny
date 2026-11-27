@@ -37,6 +37,67 @@ impl Fixture {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn flatpak_data_quarantine_requires_a_private_unchanged_tree() -> io::Result<()> {
+    let fixture = Fixture::new()?;
+    let home = parent_path(&fixture.scope)?;
+    let root = home.join(".var/app");
+    let app = root.join("org.example.Editor");
+    let files = UnixFiles::with_account(
+        vec![root.clone()],
+        Vec::new(),
+        fixture.state.clone(),
+        home.to_path_buf(),
+        rustix::process::geteuid().as_raw(),
+    )?
+    .with_linux_flatpak_data_directories(&root)?;
+    assert!(matches!(
+        files.pin_linux_flatpak_data_directory(&app),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    ));
+
+    let configuration = app.join("config");
+    let document = configuration.join("preferences");
+    fs::create_dir_all(&configuration)?;
+    fs::write(&document, b"original")?;
+    let nested_link = configuration.join("link");
+    symlink(&fixture.scope, &nested_link)?;
+    let app_alias = root.join("org.example.Alias");
+    symlink(&app, &app_alias)?;
+    assert!(matches!(
+        files.inspect_file(&app_alias)?.access,
+        Access::ReadOnly(_)
+    ));
+    assert!(matches!(
+        files.inspect_file(&configuration)?.access,
+        Access::ReadOnly(_)
+    ));
+
+    let first = files.inspect_file(&app)?;
+    assert_eq!(first.access, Access::Allowed);
+    let slot = Uuid::new_v4();
+    fs::write(&document, b"updated preferences")?;
+    assert!(matches!(
+        files.quarantine_file(&app, &first.fingerprint, slot),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+    ));
+
+    let (current, directory) = files.pin_linux_flatpak_data_directory(&app)?;
+    assert_eq!(files.inspect_file(&app)?.fingerprint, current.fingerprint);
+    files.quarantine_file(&app, &current.fingerprint, slot)?;
+    assert!(!app.exists());
+    assert!(directory.metadata()?.is_dir());
+    assert!(files.file_is_quarantined(&app, &current.fingerprint, slot)?);
+    assert!(!files.can_purge_quarantined(&app, &current.fingerprint, slot)?);
+
+    files.restore_file(&app, &current.fingerprint, slot)?;
+    assert!(files.verify_file_restored(&app, &current.fingerprint, slot)?);
+    assert_eq!(fs::read(document)?, b"updated preferences");
+    assert_eq!(fs::read_link(nested_link)?, fixture.scope);
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn audit_export_keeps_a_file_created_before_publication() -> uninstallany_core::Result<()> {
@@ -393,6 +454,40 @@ fn journals_are_lazy_private_and_refuse_replacements() -> io::Result<()> {
     );
     let artifact = fixture.guard.location(id, Artifact::Manifest);
     assert_eq!(fs::metadata(&artifact)?.permissions().mode() & 0o077, 0);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reopening_the_journal_with_user_launch_agents_preserves_access() -> io::Result<()> {
+    let fixture = Fixture::new()?;
+    let previous = Uuid::new_v4();
+    fixture
+        .guard
+        .create(previous, Artifact::Event, b"previous")?;
+
+    let home = fixture.guard.home.clone();
+    let launch_agents = home.join("Library/LaunchAgents");
+    let reopened = UnixFiles::with_account(
+        vec![home.clone(), launch_agents],
+        vec![fixture.protected],
+        fixture.state,
+        home,
+        fixture.guard.uid,
+    )?
+    .with_user_launch_agents()?;
+
+    reopened.create(Uuid::new_v4(), Artifact::Event, b"current")?;
+    assert_eq!(
+        reopened.read(previous, Artifact::Event)?.as_deref(),
+        Some(b"previous".as_slice())
+    );
+    assert!(matches!(
+        reopened
+            .inspect_file(&reopened.location(previous, Artifact::Event))?
+            .access,
+        Access::ReadOnly(_)
+    ));
     Ok(())
 }
 

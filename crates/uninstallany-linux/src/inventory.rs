@@ -3,10 +3,12 @@ use std::{collections::HashSet, path::Path};
 use chrono::{DateTime, Utc};
 use uninstallany_core::{AppId, AppRecord, Cancellation, Error, Inventory, Result};
 
-use crate::command::{Program, query};
+use crate::{
+    command::{Program, query},
+    dpkg::{DPKG_ADMIN_DIR, DPKG_FORMAT, DPKG_QUERY_BIN, DpkgRow},
+};
 
 const MAX_PACKAGES: usize = 50_000;
-const DPKG_FORMAT: &str = "${db:Status-Status}\\t${Package}\\t${Architecture}\\t${Version}\\t${Installed-Size}\\t${Maintainer}\\t${Essential}\\t${Priority}\\t${Section}\\n";
 const RPM_FORMAT: &str = "%{NAME}\\t%{ARCH}\\t%{EPOCH}\\t%{VERSION}\\t%{RELEASE}\\t%{SIZE}\\t%{PACKAGER}\\t%{INSTALLTIME}\\t%{GROUP}\\n";
 const FLATPAK_COLUMNS: &str = "--columns=ref:full,name:full,version:full,origin:full,size:full";
 
@@ -75,7 +77,7 @@ impl Source {
 
     fn query_arguments(self) -> &'static [&'static str] {
         match self {
-            Self::Dpkg => &["--show", "--showformat", DPKG_FORMAT],
+            Self::Dpkg => &[DPKG_ADMIN_DIR, "--show", "--showformat", DPKG_FORMAT],
             Self::Rpm => &["--query", "--all", "--queryformat", RPM_FORMAT],
             Self::Pacman => &["--query", "--info", "--color", "never"],
             Self::FlatpakUser => &["list", "--user", "--app", FLATPAK_COLUMNS],
@@ -102,11 +104,47 @@ pub(crate) fn visit(
     cancel: &Cancellation,
 ) -> Result<Option<Inventory>> {
     cancel.check()?;
-    let Some(program) = source.command().and_then(Program::find) else {
+    let program = if source == Source::Dpkg {
+        Program::fixed(Path::new(DPKG_QUERY_BIN)).ok()
+    } else {
+        source.command().and_then(Program::find)
+    };
+    let Some(program) = program else {
         return Ok(None);
     };
     let output = query(&program, home, data, source.query_arguments(), cancel)?;
-    parse(source, &output, cancel).map(Some)
+    let mut inventory = parse(source, &output, cancel)?;
+    let removal_environment_available = match source {
+        Source::Dpkg => dpkg_helper_available(),
+        Source::Pacman => inventory.warnings.is_empty() && pacman_helper_available(),
+        _ => true,
+    };
+    if !removal_environment_available {
+        for record in &mut inventory.applications {
+            record.official_uninstall_available = false;
+        }
+    }
+    Ok(Some(inventory))
+}
+
+#[cfg(target_os = "linux")]
+fn dpkg_helper_available() -> bool {
+    crate::dpkg_transport::HELPER.launcher().is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dpkg_helper_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn pacman_helper_available() -> bool {
+    crate::pacman_transport::launcher().is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pacman_helper_available() -> bool {
+    false
 }
 
 fn parse(source: Source, output: &str, cancel: &Cancellation) -> Result<Inventory> {
@@ -181,6 +219,18 @@ fn field(text: &str) -> Option<String> {
 }
 
 fn component(value: &str) -> bool {
+    package_component(value, b"._+-")
+}
+
+pub(crate) fn pacman_name(value: &str) -> bool {
+    package_component(value, b"@._+-")
+}
+
+pub(crate) fn pacman_version(value: &str) -> bool {
+    package_component(value, b":@._+-~^")
+}
+
+fn package_component(value: &str, punctuation: &[u8]) -> bool {
     value
         .as_bytes()
         .first()
@@ -188,10 +238,10 @@ fn component(value: &str) -> bool {
         && value.len() <= 250
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte))
 }
 
-fn core_system_package(name: &str) -> bool {
+pub(crate) fn core_system_package(name: &str) -> bool {
     matches!(
         name,
         "apt"
@@ -221,33 +271,23 @@ fn core_system_package(name: &str) -> bool {
 }
 
 fn dpkg(line: &str) -> std::result::Result<Option<AppRecord>, ()> {
-    let mut fields = line.splitn(9, '\t');
-    let status = fields.next().ok_or(())?;
-    if status != "installed" {
+    let row = DpkgRow::parse(line)?;
+    if row.status != "installed" {
         return Ok(None);
     }
-    let name = fields.next().filter(|field| component(field)).ok_or(())?;
-    let arch = fields.next().filter(|field| component(field)).ok_or(())?;
-    let version = field(fields.next().ok_or(())?);
-    let size = fields
-        .next()
-        .ok_or(())?
+    let size = row
+        .installed_size
         .parse::<u64>()
         .ok()
         .and_then(|kb| kb.checked_mul(1024));
-    let publisher = field(fields.next().ok_or(())?);
-    let essential = fields.next().ok_or(())? == "yes";
-    let priority = fields.next().ok_or(())?;
-    let section = fields.next().ok_or(())?.rsplit('/').next().ok_or(())?;
+    let identity = format!("{}:{}", row.name, row.architecture);
     Ok(Some(AppRecord {
-        version,
-        publisher,
+        version: field(row.version),
+        publisher: field(row.maintainer),
         size_bytes: size,
-        system_component: essential
-            || core_system_package(name)
-            || matches!(priority, "required" | "important")
-            || matches!(section, "libs" | "libdevel" | "kernel" | "debian-installer"),
-        ..record(Source::Dpkg, &format!("{name}:{arch}"), name)
+        system_component: row.system_component(),
+        official_uninstall_available: row.removable(),
+        ..record(Source::Dpkg, &identity, row.name)
     }))
 }
 
@@ -288,7 +328,7 @@ fn pacman(block: &str) -> std::result::Result<Option<AppRecord>, ()> {
     let mut version = None;
     let mut publisher = None;
     let mut size = None;
-    let mut system = false;
+    let mut explicitly_installed = false;
     for (key, value) in block.lines().filter_map(|line| line.split_once(':')) {
         match key.trim_end() {
             "Name" => name = Some(value.trim()),
@@ -296,17 +336,20 @@ fn pacman(block: &str) -> std::result::Result<Option<AppRecord>, ()> {
             "Packager" => publisher = field(value),
             "Installed Size" => size = parse_size(value),
             "Install Reason" => {
-                system = value.trim_start().starts_with("Installed as a dependency")
+                explicitly_installed = value.trim() == "Explicitly installed";
             }
             _ => {}
         }
     }
-    let name = name.filter(|value| component(value)).ok_or(())?;
+    let name = name.filter(|value| pacman_name(value)).ok_or(())?;
+    let system_component = !explicitly_installed || core_system_package(name);
     Ok(Some(AppRecord {
+        official_uninstall_available: !system_component
+            && version.as_deref().is_some_and(pacman_version),
         version,
         publisher,
         size_bytes: size,
-        system_component: system || core_system_package(name),
+        system_component,
         ..record(Source::Pacman, name, name)
     }))
 }
@@ -451,7 +494,7 @@ mod tests {
     fn dpkg_filters_residual_configuration_rows_and_preserves_multiarch_identity() -> Result<()> {
         let inventory = parse(
             Source::Dpkg,
-            "config-files\tretired\tamd64\t1\t5\tExample\tno\toptional\tutils\ninstalled\tlibexample\tarm64\t1.2\t42\tExample\tno\toptional\tlibs\n",
+            "config-files\tretired\tamd64\t1\t5\tExample\tno\toptional\tutils\tno\tdeinstall\tok\ninstalled\tlibexample\tarm64\t1.2\t42\tExample\tno\toptional\tlibs\tno\tinstall\tok\n",
             &Cancellation::default(),
         )?;
         assert_eq!(inventory.applications.len(), 1);

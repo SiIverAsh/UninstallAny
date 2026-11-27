@@ -35,6 +35,7 @@ struct MockState {
     registry: HashMap<RegistryTarget, String>,
     registry_receipts: Option<HashMap<Uuid, MockRegistryReceipt>>,
     applications: Vec<AppRecord>,
+    bundle_uninstall: Option<AppId>,
     launches: Vec<AppId>,
     official_absence_checks: Vec<AppId>,
     official_error: Option<&'static str>,
@@ -583,6 +584,52 @@ impl PlatformBackend for Fake {
         Ok((intent, app.id.clone()))
     }
 
+    fn prepare_application_uninstall(
+        &self,
+        app: &AppRecord,
+        _retention_days: NonZeroU16,
+        cancel: &Cancellation,
+    ) -> Result<(OfficialIntent, ApplicationUninstall<Self::Official>)> {
+        cancel.check()?;
+        let (intent, command) = self.prepare_official(app)?;
+        if self.0.borrow().bundle_uninstall.as_ref() != Some(&app.id) {
+            return Ok((intent, ApplicationUninstall::Official(command)));
+        }
+        let path = app
+            .install_location
+            .as_deref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        Ok((
+            intent,
+            ApplicationUninstall::QuarantineBundle {
+                fingerprint: self.inspect_file(path)?.fingerprint,
+                observed_files: HashMap::new(),
+            },
+        ))
+    }
+
+    fn run_bundle_uninstall(
+        &self,
+        app: &AppRecord,
+        observed_files: HashMap<PathBuf, String>,
+        cancel: &Cancellation,
+        quarantine: impl FnOnce() -> Result<()>,
+    ) -> Result<OfficialExecution> {
+        cancel.check()?;
+        quarantine()?;
+        self.0
+            .borrow_mut()
+            .applications
+            .retain(|item| item.id != app.id);
+        Ok(OfficialExecution {
+            outcome: OfficialOutcome::Completed,
+            warnings: Vec::new(),
+            read_only_residuals: Vec::new(),
+            observed_files,
+            post_uninstall_check: None,
+        })
+    }
+
     fn run_official(&self, command: Self::Official) -> Result<OfficialOutcome> {
         let mut state = self.0.borrow_mut();
         state.launches.push(command.clone());
@@ -710,6 +757,91 @@ fn registry_target() -> RegistryTarget {
         key: r"Software\Studio Eight\Example Tool".into(),
         value: Some("TestSetting".into()),
     }
+}
+
+#[test]
+fn inspect_residuals_cannot_confirm_otherwise_writable_candidates() -> Result<()> {
+    let fake = Fake::default();
+    let app = application("Example Editor");
+    let residual = path("apps/Editor/config");
+    {
+        let mut state = fake.0.borrow_mut();
+        state.applications.push(app.clone());
+        state.files.insert(residual.clone(), file("original"));
+    }
+    let engine = Engine::new(fake.clone(), MemoryJournal::default());
+    let cancel = Cancellation::default();
+    let plan = engine.inspect_residuals(&app.id, &cancel)?;
+    let candidate_id = {
+        let mut candidates = plan.candidates();
+        let candidate = candidates.next().expect("residual candidate");
+        assert!(candidates.next().is_none());
+        assert_eq!(candidate.target, Target::File(residual.clone()));
+        assert!(matches!(candidate.access, Access::ReadOnly(_)));
+        assert!(!candidate.default_selected());
+        candidate.id
+    };
+    assert!(matches!(
+        plan.confirm(&[candidate_id]),
+        Err(Error::Rejected(_))
+    ));
+    let state = fake.0.borrow();
+    assert!(state.files.contains_key(&residual));
+    assert!(state.quarantine.is_empty());
+    Ok(())
+}
+
+#[test]
+fn bundle_uninstall_and_residuals_share_one_batch_and_restore_the_bundle_first() -> Result<()> {
+    let fake = Fake::default();
+    let bundle = path("z-apps/Editor.app");
+    let residual = path("a-cache/Editor-settings");
+    let app = AppRecord {
+        install_location: Some(bundle.clone()),
+        ..application("Example Editor")
+    };
+    {
+        let mut state = fake.0.borrow_mut();
+        state.bundle_uninstall = Some(app.id.clone());
+        state.applications.push(app.clone());
+        state.files.insert(bundle.clone(), file("bundle"));
+        state.files.insert(residual.clone(), file("settings"));
+    }
+    let engine = Engine::new(fake.clone(), MemoryJournal::default());
+    let cancel = Cancellation::default();
+    let confirmed = engine.prepare_uninstall(&app.id, &cancel)?.confirm()?;
+    let report = engine.run_uninstall(confirmed, &cancel)?;
+    assert_eq!(report.outcome, OfficialOutcome::Completed);
+    let batch = report
+        .application_backup_batch
+        .expect("bundle backup batch");
+    assert!(!fake.0.borrow().files.contains_key(&bundle));
+    assert!(fake.0.borrow().files.contains_key(&residual));
+
+    let plan = report.cleanup.expect("post-uninstall residual preview");
+    let selected: Vec<_> = plan.candidates().map(|candidate| candidate.id).collect();
+    assert_eq!(selected.len(), 1);
+    let cleanup = engine.apply(plan.confirm(&selected)?, &cancel)?;
+    assert_eq!(cleanup.batch_id, batch);
+    assert!(matches!(
+        cleanup.items.as_slice(),
+        [item] if matches!(item.result, ChangeResult::Applied)
+    ));
+
+    let restore = engine.prepare_restore(batch)?;
+    let restored = engine.restore(restore.confirm()?, &cancel)?;
+    let [application, settings] = restored.items.as_slice() else {
+        panic!("expected both objects in the shared restore batch");
+    };
+    assert_eq!(application.target, Target::File(bundle.clone()).display());
+    assert_eq!(settings.target, Target::File(residual.clone()).display());
+    assert!(matches!(application.result, ChangeResult::Restored));
+    assert!(matches!(settings.result, ChangeResult::Restored));
+    let state = fake.0.borrow();
+    assert!(state.files.contains_key(&bundle));
+    assert!(state.files.contains_key(&residual));
+    assert!(state.quarantine.is_empty());
+    Ok(())
 }
 
 #[test]

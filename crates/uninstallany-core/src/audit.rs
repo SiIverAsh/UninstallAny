@@ -25,6 +25,7 @@ pub struct AuditExport {
 #[serde(rename_all = "snake_case")]
 enum RecordKind {
     Event,
+    SnapSnapshot,
     Applied,
     Restored,
     Purged,
@@ -35,6 +36,7 @@ impl RecordKind {
     fn artifact(self) -> Artifact {
         match self {
             Self::Event => Artifact::Event,
+            Self::SnapSnapshot => Artifact::SnapSnapshot,
             Self::Applied => Artifact::Applied,
             Self::Restored => Artifact::Restored,
             Self::Purged => Artifact::Purged,
@@ -45,6 +47,17 @@ impl RecordKind {
     fn valid(self, id: Uuid, event: &AuditEvent) -> bool {
         let (action, result) = match self {
             Self::Event => return true,
+            Self::SnapSnapshot => {
+                return event.operation_id == Some(id)
+                    && event.action == "snap_snapshot"
+                    && event.result == "succeeded"
+                    && event.backup.as_deref().is_some_and(|backup| {
+                        backup
+                            .strip_prefix("snapd://snapshot/")
+                            .and_then(|id| id.parse::<std::num::NonZeroU64>().ok())
+                            .is_some()
+                    });
+            }
             Self::Applied => ("cleanup", "applied"),
             Self::Restored => ("restore", "restored"),
             Self::Purged => ("purge_quarantine", "purged"),
@@ -211,6 +224,7 @@ fn index(
     let mut records = Vec::new();
     for kind in [
         RecordKind::Event,
+        RecordKind::SnapSnapshot,
         RecordKind::Applied,
         RecordKind::Restored,
         RecordKind::Purged,
@@ -365,6 +379,7 @@ fn validate_export_path(path: &Path) -> Result<()> {
         .ok_or_else(|| Error::Rejected("choose a file name for the audit report".into()))?;
     let artifact_name = [
         Artifact::Event,
+        Artifact::SnapSnapshot,
         Artifact::Manifest,
         Artifact::Applied,
         Artifact::Restored,

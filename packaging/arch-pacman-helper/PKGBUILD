@@ -1,0 +1,37 @@
+pkgname=uninstallany-pacman-helper
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Administrator-authorized single-package pacman removal for UninstallAny'
+arch=('x86_64' 'aarch64')
+url='https://github.com/SiIverAsh/UninstallAny'
+license=('LicenseRef-Unspecified')
+depends=('pacman>=7.0' 'libalpm.so' 'polkit')
+makedepends=('pkgconf')
+source=('main.c' 'io.github.siiverash.uninstallany.pacman.policy')
+sha256sums=(
+  'b92a52e849cf4d47825845982f23a00eece7cab058d9a271e3aa96dcc34ada2f'
+  'b7aa0253f28c246fea8e0fb15d66afc327024b4f25072d6d47583296871aa3e5'
+)
+
+build() {
+  local -a compiler cpp_flags c_flags ld_flags alpm_c_flags alpm_libs
+  local alpm_c_output alpm_lib_output
+  alpm_c_output=$(pkg-config --cflags libalpm) || return
+  alpm_lib_output=$(pkg-config --libs libalpm) || return
+  read -r -a compiler <<< "${CC:-cc}"
+  read -r -a cpp_flags <<< "${CPPFLAGS:-}"
+  read -r -a c_flags <<< "${CFLAGS:-}"
+  read -r -a ld_flags <<< "${LDFLAGS:-}"
+  read -r -a alpm_c_flags <<< "$alpm_c_output"
+  read -r -a alpm_libs <<< "$alpm_lib_output"
+
+  "${compiler[@]}" -std=c17 -Wall -Wextra -Werror \
+    "${cpp_flags[@]}" "${c_flags[@]}" "${alpm_c_flags[@]}" \
+    "$srcdir/main.c" -o "$srcdir/$pkgname" "${ld_flags[@]}" "${alpm_libs[@]}"
+}
+
+package() {
+  local policy=io.github.siiverash.uninstallany.pacman.policy
+  install -Dm755 -- "$srcdir/$pkgname" "$pkgdir/usr/libexec/$pkgname"
+  install -Dm644 -- "$srcdir/$policy" "$pkgdir/usr/share/polkit-1/actions/$policy"
+}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import struct
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -138,6 +139,18 @@ class PackageReleaseTest(unittest.TestCase):
                 self.assertEqual(
                     package.getinfo(member.name).date_time, (1980, 1, 1, 0, 0, 0)
                 )
+
+    def test_cli_archive_publishes_a_terminal_executable_and_guide(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            binary = folder / "app"
+            target = release.TARGETS["x86_64-unknown-linux-gnu"]
+            binary.write_bytes(_elf(target.machine, b"/lib64/ld-linux-x86-64.so.2\0"))
+            archive = release._publish(binary, target, "1.2.3", folder, cli=True)
+            self.assertEqual(archive.name, "UninstallAny-CLI-1.2.3-linux-x64.tar.gz")
+            with tarfile.open(archive) as package:
+                self.assertEqual(package.getnames(), ["README.md", "uninstallany"])
+                self.assertEqual(package.getmember("uninstallany").mode, 0o755)
 
     def test_size_failure_leaves_no_published_package(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

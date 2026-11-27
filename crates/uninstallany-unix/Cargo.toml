@@ -9,11 +9,9 @@ libc = "0.2"
 rustix = { version = "1", features = ["fs", "process"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 uninstallany-core = { path = "../uninstallany-core" }
 uuid.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-sha2.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
 tempfile = "3"

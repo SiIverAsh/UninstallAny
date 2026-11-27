@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+  <vendor>UninstallAny</vendor>
+  <vendor_url>https://github.com/SiIverAsh/UninstallAny</vendor_url>
+  <action id="io.github.siiverash.uninstallany.pacman.remove">
+    <description>Remove a pacman package with UninstallAny</description>
+    <description xml:lang="zh_CN">通过 UninstallAny 卸载 pacman 软件包</description>
+    <message>Administrator authentication is required to remove this package. Command: $(command_line)</message>
+    <message xml:lang="zh_CN">卸载此软件包需要管理员身份验证。命令：$(command_line)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/uninstallany-pacman-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove</annotate>
+  </action>
+</policyconfig>

@@ -8,6 +8,7 @@ mod app_signature;
 mod blessed_helpers;
 mod brew;
 mod brew_review;
+mod brew_uninstall;
 mod bundle;
 mod expiry_plan;
 #[cfg(feature = "privileged-inspection")]
@@ -101,6 +102,10 @@ struct BundleConflicts {
 
 enum MacUninstall {
     Vendor(Box<vendor::Prepared>),
+    Homebrew {
+        command: Box<brew_uninstall::Prepared>,
+        observed_files: HashMap<PathBuf, String>,
+    },
     #[cfg(feature = "privileged-inspection")]
     SystemQuarantine(Box<selected_bundle::PreparedSystemUninstall>),
 }
@@ -447,7 +452,10 @@ impl MacBackend {
             if let Some(index) = matched {
                 merged[index] = true;
             }
-            let record = cask.record(matched.map(|index| &bundles[index]));
+            let removable = allow_vendor && matched.is_some() && cask.supports_native_removal();
+            let mut record = cask.record(matched.map(|index| &bundles[index]));
+            record.official_uninstall_available =
+                removable && !record.system_component && brew_uninstall::available(&record);
             if include(&record.id, record.install_location.as_deref()) {
                 inventory.applications.push(record);
             }
@@ -638,6 +646,36 @@ impl MacBackend {
         Ok(observations)
     }
 
+    fn homebrew_launch_state(
+        &self,
+        command: &brew_uninstall::Prepared,
+        cancel: &Cancellation,
+    ) -> Result<HashMap<PathBuf, String>> {
+        let path = command.application_path();
+        if self.scan_bundle_services(path, &mut Scan::default(), cancel)? {
+            return Err(Error::Rejected(
+                "The application has background services that require their own uninstall procedure.".into(),
+            ));
+        }
+        self.standalone_launch_agents(path, command.bundle_identifier(), cancel)
+    }
+
+    fn prepare_homebrew(
+        &self,
+        app: &AppRecord,
+        cancel: &Cancellation,
+    ) -> Result<(OfficialIntent, MacUninstall)> {
+        let (intent, command) = brew_uninstall::prepare(&self.files, &self.home, app, cancel)?;
+        let observed_files = self.homebrew_launch_state(&command, cancel)?;
+        Ok((
+            intent,
+            MacUninstall::Homebrew {
+                command: Box::new(command),
+                observed_files,
+            },
+        ))
+    }
+
     fn scan_application(
         &self,
         app: &AppRecord,
@@ -780,8 +818,10 @@ impl MacBackend {
         if mode == ScanMode::AfterOfficialUninstall {
             scan::http_storage_after_uninstall(&self.files, &mut result, &search, cancel)?;
         }
-        if let Some(cask) = cask {
-            result.warnings.push(brew::UNINSTALL_UNAVAILABLE.into());
+        if let Some(cask) = cask.filter(|_| mode != ScanMode::AfterOfficialUninstall) {
+            if !app.official_uninstall_available {
+                result.warnings.push(brew::UNINSTALL_UNAVAILABLE.into());
+            }
             match brew::add_review(&self.files, &self.home, &cask, &mut result, cancel) {
                 Ok(()) => {}
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
@@ -973,6 +1013,9 @@ impl PlatformBackend for MacBackend {
     }
 
     fn prepare_official(&self, app: &AppRecord) -> Result<(OfficialIntent, Self::Official)> {
+        if matches!(&app.id, AppId::Package { manager, .. } if manager == brew::MANAGER) {
+            return self.prepare_homebrew(app, &Cancellation::default());
+        }
         if !matches!(&app.id, AppId::Package { manager, .. } if manager == bundle::MANAGER) {
             return Err(Error::Rejected(
                 "no verified vendor uninstaller for this application source".into(),
@@ -998,6 +1041,10 @@ impl PlatformBackend for MacBackend {
         cancel: &Cancellation,
     ) -> Result<(OfficialIntent, ApplicationUninstall<Self::Official>)> {
         cancel.check()?;
+        if matches!(&app.id, AppId::Package { manager, .. } if manager == brew::MANAGER) {
+            let (intent, command) = self.prepare_homebrew(app, cancel)?;
+            return Ok((intent, ApplicationUninstall::Official(command)));
+        }
         if !matches!(&app.id, AppId::Package { manager, .. } if manager == bundle::MANAGER)
             || app.system_component
         {
@@ -1138,6 +1185,21 @@ impl PlatformBackend for MacBackend {
     ) -> Result<OfficialExecution> {
         let command = match command {
             MacUninstall::Vendor(command) => *command,
+            MacUninstall::Homebrew {
+                command,
+                observed_files,
+            } => {
+                if self.homebrew_launch_state(&command, cancel)? != observed_files {
+                    return Err(Error::Rejected(
+                        "The application's LaunchAgents changed. Review the uninstall again."
+                            .into(),
+                    ));
+                }
+                let mut execution =
+                    brew_uninstall::uninstall(&self.files, &self.home, *command, cancel)?;
+                execution.observed_files.extend(observed_files);
+                return Ok(execution);
+            }
             #[cfg(feature = "privileged-inspection")]
             MacUninstall::SystemQuarantine(command) => return command.execute(self, cancel),
         };
@@ -1225,6 +1287,9 @@ impl PlatformBackend for MacBackend {
         cancel: &Cancellation,
     ) -> Result<bool> {
         cancel.check()?;
+        if matches!(&app.id, AppId::Package { manager, .. } if manager == brew::MANAGER) {
+            return brew_uninstall::verify_absent(&self.files, app, cancel);
+        }
         if !matches!(&app.id, AppId::Package { manager, .. } if manager == bundle::MANAGER) {
             return Ok(false);
         }

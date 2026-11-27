@@ -66,6 +66,7 @@ enum CleanupSource {
         app: Box<AppRecord>,
         observed_files: HashMap<PathBuf, String>,
         post_uninstall_check: Option<PostUninstallCheck>,
+        application_backup_batch: Option<Uuid>,
     },
     Portable(PathBuf),
     ReadOnly,
@@ -75,6 +76,7 @@ struct CleanupChecks<'a> {
     file_application: Option<&'a AppId>,
     post_uninstall: Option<PostUninstallCleanup<'a>>,
     force_removal: Option<(&'a AppId, &'a str)>,
+    application_installation: bool,
 }
 
 struct PostUninstallCleanup<'a> {
@@ -178,6 +180,11 @@ pub struct PreparedUninstall<Command> {
 }
 
 impl<Command> PreparedUninstall<Command> {
+    /// Returns the application metadata captured by this uninstall review.
+    pub fn application(&self) -> &AppRecord {
+        &self.app
+    }
+
     /// Shows the effect of the prepared command without exposing private arguments.
     pub fn intent(&self) -> &OfficialIntent {
         &self.intent
@@ -198,6 +205,9 @@ pub struct UninstallReport {
     pub outcome: OfficialOutcome,
     pub cleanup: Option<CleanupPlan>,
     pub warnings: Vec<String>,
+    /// Batch containing the application moved through the core quarantine.
+    /// Confirmed leftover backups from this uninstall join the same batch.
+    pub application_backup_batch: Option<Uuid>,
 }
 
 /// One entry of the serial uninstall queue.
@@ -341,6 +351,17 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
         )
     }
 
+    /// Shows residual evidence for an installed app without offering write approval.
+    pub fn inspect_residuals(&self, app: &AppId, cancel: &Cancellation) -> Result<CleanupPlan> {
+        self.scan_app(
+            &self.find_app(app, cancel)?,
+            ScanMode::Leftovers,
+            CleanupSource::ReadOnly,
+            Vec::new(),
+            cancel,
+        )
+    }
+
     /// Builds a stronger-warning dry-run for a missing or failed official uninstall.
     pub fn force_removal(&self, app: &AppId, cancel: &Cancellation) -> Result<CleanupPlan> {
         let mut plan = self.scan_app(
@@ -451,6 +472,7 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
             ApplicationUninstall::QuarantineBundle { .. } => ("quarantine_uninstall", true),
         };
         self.event(prepared.app.name.clone(), action, "starting")?;
+        let mut application_backup_batch = None;
         let execution = match prepared.action {
             ApplicationUninstall::Official(command)
             | ApplicationUninstall::PlatformQuarantine(command) => {
@@ -462,7 +484,10 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
             } => self
                 .platform
                 .run_bundle_uninstall(&current, observed_files, cancel, || {
-                    self.quarantine_application_bundle(&prepared.app, &fingerprint, cancel)
+                    let batch = Uuid::new_v4();
+                    self.quarantine_application_bundle(&prepared.app, &fingerprint, batch, cancel)?;
+                    application_backup_batch = Some(batch);
+                    Ok(())
                 }),
         };
         let description = match &execution {
@@ -493,7 +518,7 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
         };
         self.scan_after_uninstall(
             &prepared.app,
-            execution,
+            (execution, application_backup_batch),
             outcome_audit_error,
             verification_cancel,
             cancel,
@@ -504,6 +529,7 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
         &self,
         app: &AppRecord,
         fingerprint: &str,
+        batch: Uuid,
         cancel: &Cancellation,
     ) -> Result<()> {
         let path = app
@@ -512,13 +538,14 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
             .filter(|path| valid_file_address(path))
             .ok_or_else(|| Error::Rejected("application installation path is invalid".into()))?;
         self.apply_item(
-            (Uuid::new_v4(), Uuid::new_v4()),
+            (batch, Uuid::new_v4()),
             Target::File(path.clone()),
             (fingerprint, false),
             &CleanupChecks {
                 file_application: Some(&app.id),
                 post_uninstall: None,
                 force_removal: None,
+                application_installation: true,
             },
             cancel,
         )
@@ -674,11 +701,13 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
         let checks = CleanupChecks {
             file_application: file_cleanup_application.as_ref(),
             force_removal,
+            application_installation: false,
             post_uninstall: match &source {
                 CleanupSource::Uninstalled {
                     app,
                     observed_files,
                     post_uninstall_check,
+                    ..
                 } => Some(PostUninstallCleanup {
                     app,
                     observed_files,
@@ -754,6 +783,7 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
                 app,
                 observed_files,
                 post_uninstall_check,
+                ..
             } => {
                 self.require_post_uninstall_state(app, post_uninstall_check.as_ref(), cancel)?;
                 self.require_post_uninstall_cleanup_state(app, observed_files, cancel)?;
@@ -868,13 +898,17 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
                         ),
                         _ => (true, false),
                     };
-                    entries.push((priority, summary, record));
+                    entries.push((
+                        (!record.application_installation, priority),
+                        summary,
+                        record,
+                    ));
                 }
                 Ok(_) => {}
                 Err(error) => warnings.push(format!("backup {id}: {error}")),
             }
         }
-        // Restore executables before files or registry values that reference them.
+        // Restore the application first, then ordinary files before registrations.
         entries.sort_by(|(left_priority, left, _), (right_priority, right, _)| {
             left_priority
                 .cmp(right_priority)
@@ -1012,7 +1046,7 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
     fn scan_after_uninstall(
         &self,
         app: &AppRecord,
-        mut execution: OfficialExecution,
+        (mut execution, application_backup_batch): (OfficialExecution, Option<Uuid>),
         outcome_audit_error: Option<Error>,
         verification_cancel: &Cancellation,
         cancel: &Cancellation,
@@ -1028,6 +1062,7 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
             outcome: execution.outcome,
             cleanup: None,
             warnings: execution.warnings,
+            application_backup_batch,
         };
         let mut audit_complete = outcome_audit_error.is_none();
         if let Some(error) = outcome_audit_error {
@@ -1088,6 +1123,7 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
                 app: Box::new(app.clone()),
                 observed_files: execution.observed_files,
                 post_uninstall_check: execution.post_uninstall_check,
+                application_backup_batch,
             },
             execution.read_only_residuals,
             cancel,
@@ -1110,8 +1146,13 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
     ) -> Result<CleanupPlan> {
         let mut entries: Vec<Reviewed> = Vec::new();
         let mut indices = HashMap::new();
-        for proposal in scan.proposals {
+        let read_only = matches!(&source, CleanupSource::ReadOnly);
+        for mut proposal in scan.proposals {
             cancel.check()?;
+            if read_only && proposal.access == Access::Allowed {
+                proposal.access =
+                    Access::ReadOnly("this residual preview is for inspection only".into());
+            }
             if let Some(index) = indices.get(&proposal.target).copied() {
                 let existing: &mut Reviewed = &mut entries[index];
                 if let Access::ReadOnly(reason) = proposal.access {
@@ -1132,7 +1173,13 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
                 if scan.post_uninstall_file_guards.contains(path));
             entries.push(self.review_item(entries.len(), proposal, observation, requires_guard));
         }
-        let id = Uuid::new_v4();
+        let id = match &source {
+            CleanupSource::Uninstalled {
+                application_backup_batch: Some(batch),
+                ..
+            } => *batch,
+            _ => Uuid::new_v4(),
+        };
         let mut event = AuditEvent::new("cleanup candidates".into(), "dry_run", "ready");
         event.batch_id = Some(id);
         put_json(&self.journal, Uuid::new_v4(), Artifact::Event, &event)?;
@@ -1235,6 +1282,7 @@ impl<P: PlatformBackend, J: Journal> Engine<P, J> {
             backup_path.display().to_string(),
             self.retention_days,
         );
+        record.application_installation = checks.application_installation;
         cancel.check()?;
         match &target {
             Target::File(path) => {

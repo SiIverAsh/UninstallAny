@@ -153,7 +153,10 @@ impl LinuxPaths {
                 ));
             }
         }
-        UnixFiles::new(roots, protected, self.state.clone())
+        let files = UnixFiles::new(roots, protected, self.state.clone())?;
+        #[cfg(target_os = "linux")]
+        let files = files.with_linux_flatpak_data_directories(&self.flatpak_data)?;
+        Ok(files)
     }
 }
 

@@ -14,6 +14,8 @@ use crate::{Cancellation, Error, Result, Target};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Artifact {
     Event,
+    /// Snap's recorded data snapshot, saved before native removal.
+    SnapSnapshot,
     Manifest,
     Applied,
     Restored,
@@ -38,6 +40,7 @@ impl Artifact {
     fn suffix(self) -> &'static str {
         match self {
             Self::Event => "event.json",
+            Self::SnapSnapshot => "snap-snapshot.json",
             Self::Manifest => "manifest.json",
             Self::Applied => "applied.json",
             Self::Restored => "restored.json",
@@ -172,6 +175,8 @@ pub(crate) struct BackupRecord {
     pub(crate) backup: String,
     pub(crate) expires_unix_ms: u64,
     pub(crate) registry_snapshot_digest: Option<[u8; 32]>,
+    #[serde(default)]
+    pub(crate) application_installation: bool,
 }
 
 impl BackupRecord {
@@ -203,6 +208,7 @@ impl BackupRecord {
             backup,
             expires_unix_ms: now().saturating_add(millis(lifetime)),
             registry_snapshot_digest: None,
+            application_installation: false,
         }
     }
 

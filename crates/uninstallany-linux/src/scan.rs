@@ -7,7 +7,7 @@ use std::{
 
 use uninstallany_core::{
     Access, AppRecord, Cancellation, Category, Error, Inventory, MatchKind, Proposal, Result, Risk,
-    Scan, Target, match_name,
+    Scan, ScanMode, Target, match_name,
 };
 use uninstallany_unix::UnixFiles;
 
@@ -22,10 +22,12 @@ const DESCENT_LIMIT: usize = 5;
 const SERVICE_SUFFIXES: &[&str] = &["service", "socket", "timer", "path", "automount", "mount"];
 const LINK_OWNER_UNKNOWN: &str = "startup or service identity has not been independently verified";
 const APP_COMPETITOR: &str = "the data path may also belong to another installed application";
-const FLATPAK_NAMED_INSTALLATIONS: &str = "/etc/flatpak/installations.d";
+const APPIMAGE_OWNER_UNKNOWN: &str = "the AppImage path does not establish ownership of its data";
+const FLATPAK_DATA_REASON: &str = "Flatpak application ID identifies the sandbox directory";
 
 pub(crate) fn application(
     app: &AppRecord,
+    mode: ScanMode,
     files: &UnixFiles,
     paths: &LinuxPaths,
     inventory: &Inventory,
@@ -40,7 +42,7 @@ pub(crate) fn application(
         scan: Scan::default(),
         seen: HashSet::new(),
     };
-    scan.add_artifact(app, paths, source)?;
+    scan.add_artifact(app, paths, source, mode)?;
     let match_names = SearchTerms::new(app, source, id);
     let shared = scan.is_shared(app, inventory, &match_names);
     let still_registered = match_names.namespace.is_some()
@@ -56,6 +58,12 @@ pub(crate) fn application(
         Access::ReadOnly(APP_COMPETITOR.into())
     } else if still_registered {
         Access::ReadOnly("the Flatpak application is still installed".into())
+    } else if match_names.namespace.is_some() {
+        Access::ReadOnly("name-based Flatpak residuals do not establish data ownership".into())
+    } else if source == Source::AppImage {
+        Access::ReadOnly(APPIMAGE_OWNER_UNKNOWN.into())
+    } else if matches!(source, Source::Dpkg | Source::Rpm | Source::Pacman) {
+        Access::ReadOnly("the package name does not establish ownership of personal data".into())
     } else {
         Access::Allowed
     };
@@ -78,6 +86,58 @@ pub(crate) fn application(
     Ok(scan.scan)
 }
 
+pub(crate) fn add_verified_appimage_launcher(scan: &mut Scan, path: PathBuf, fingerprint: String) {
+    let target = Target::File(path.clone());
+    // Replace only the generic name hint. Other discovery restrictions still
+    // participate in the core's deduplication and can veto a move.
+    scan.proposals.retain(|proposal| {
+        !(proposal.target == target
+            && proposal.category == Category::Shortcut
+            && matches!(&proposal.access, Access::ReadOnly(reason) if reason == LINK_OWNER_UNKNOWN))
+    });
+    if scan.proposals.len() >= MAX_PROPOSALS {
+        return;
+    }
+    scan.require_post_uninstall_file_guard(path);
+    scan.push_observed(
+        Proposal {
+            target,
+            category: Category::Shortcut,
+            evidence: MatchKind::ExactIdentity,
+            reason: "this desktop entry points directly to the same AppImage as before uninstall"
+                .into(),
+            risk: Risk::Normal,
+            access: Access::Allowed,
+        },
+        fingerprint,
+    );
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn add_verified_flatpak_directory(scan: &mut Scan, path: PathBuf, fingerprint: String) {
+    let target = Target::File(path.clone());
+    scan.proposals.retain(|proposal| {
+        !(proposal.target == target
+            && proposal.category == Category::Directory
+            && proposal.reason == FLATPAK_DATA_REASON)
+    });
+    if scan.proposals.len() >= MAX_PROPOSALS {
+        return;
+    }
+    scan.require_post_uninstall_file_guard(path);
+    scan.push_observed(
+        Proposal {
+            target,
+            category: Category::Directory,
+            evidence: MatchKind::ExactIdentity,
+            reason: "the same Flatpak sandbox data directory was observed before uninstall; it can contain user files".into(),
+            risk: Risk::High,
+            access: Access::Allowed,
+        },
+        fingerprint,
+    );
+}
+
 pub(crate) fn portable(
     directory: &Path,
     files: &UnixFiles,
@@ -85,37 +145,7 @@ pub(crate) fn portable(
     installed: &Inventory,
     cancel: &Cancellation,
 ) -> Result<Scan> {
-    let user_home = &paths.home;
-    let shared_roots = [
-        user_home,
-        &paths.config,
-        &paths.data,
-        &paths.cache,
-        &paths.flatpak_data,
-        &paths.snap_data,
-        &user_home.join(".local"),
-        &paths.state,
-    ];
-    if !directory.starts_with(user_home)
-        || shared_roots.contains(&&directory.to_path_buf())
-        || directory.starts_with(&paths.flatpak_data)
-        || directory.starts_with(&paths.snap_data)
-        || directory.starts_with(paths.data.join("flatpak"))
-        || directory.starts_with(&paths.state)
-    {
-        return Err(Error::Rejected(
-            "choose a specific personal app directory outside package-managed data".into(),
-        ));
-    }
-    if installed.applications.iter().any(|app| {
-        app.install_location
-            .as_ref()
-            .is_some_and(|path| path.starts_with(directory) || directory.starts_with(path))
-    }) {
-        return Err(Error::Rejected(
-            "the portable directory overlaps an application already in the inventory".into(),
-        ));
-    }
+    require_portable_scope(directory, paths, installed)?;
     let mut scanner = Scanner {
         files,
         cancel,
@@ -133,6 +163,62 @@ pub(crate) fn portable(
         Risk::High,
     )?;
     Ok(scanner.scan)
+}
+
+fn require_portable_scope(
+    directory: &Path,
+    paths: &LinuxPaths,
+    installed: &Inventory,
+) -> Result<()> {
+    let user_home = &paths.home;
+    let collections = [
+        user_home,
+        &paths.config,
+        &paths.data,
+        &paths.cache,
+        &user_home.join(".local"),
+        &user_home.join(".local/bin"),
+        &user_home.join("bin"),
+    ];
+    let managed_trees = [
+        &paths.flatpak_data,
+        &paths.snap_data,
+        &paths.data.join("flatpak"),
+        &paths.state,
+    ];
+    // Applications can have dedicated directories below a collection.
+    // Managed trees can contain registrations or data owned elsewhere.
+    let contains_collection = collections
+        .into_iter()
+        .chain(&paths.appimages)
+        .any(|root| root.starts_with(directory));
+    let overlaps_managed_tree = managed_trees
+        .into_iter()
+        .chain(&paths.desktop_dirs)
+        .chain(&paths.autostart_dirs)
+        .chain(&paths.service_dirs)
+        .any(|root| directory.starts_with(root) || root.starts_with(directory));
+    if !directory.starts_with(user_home) || contains_collection || overlaps_managed_tree {
+        return Err(Error::Rejected(
+            "choose a specific personal app directory outside shared or managed locations".into(),
+        ));
+    }
+    if !installed.warnings.is_empty() {
+        return Err(Error::Rejected(
+            "the installed application inventory is incomplete; portable ownership cannot be verified"
+                .into(),
+        ));
+    }
+    if installed.applications.iter().any(|app| {
+        app.install_location
+            .as_ref()
+            .is_some_and(|path| path.starts_with(directory) || directory.starts_with(path))
+    }) {
+        return Err(Error::Rejected(
+            "the portable directory overlaps an application already in the inventory".into(),
+        ));
+    }
+    Ok(())
 }
 
 struct SearchTerms<'a> {
@@ -182,11 +268,18 @@ struct Scanner<'a> {
 }
 
 impl Scanner<'_> {
-    fn add_artifact(&mut self, app: &AppRecord, paths: &LinuxPaths, source: Source) -> Result<()> {
+    fn add_artifact(
+        &mut self,
+        app: &AppRecord,
+        paths: &LinuxPaths,
+        source: Source,
+        mode: ScanMode,
+    ) -> Result<()> {
         let Some(path) = app.install_location.as_ref() else {
             return Ok(());
         };
         if source == Source::AppImage
+            && mode != ScanMode::AfterOfficialUninstall
             && appimage_name(path)
             && paths
                 .appimages
@@ -200,7 +293,7 @@ impl Scanner<'_> {
                 MatchKind::ExactIdentity,
                 "verified AppImage binary at its enumerated path",
                 Risk::Normal,
-                Access::Allowed,
+                Access::ReadOnly("use the AppImage uninstall review to move the binary".into()),
             );
         } else if source == Source::Desktop {
             let access = match read_launcher(self.files, path)? {
@@ -236,26 +329,6 @@ impl Scanner<'_> {
         self.scan
             .warnings
             .extend(inventory.warnings.iter().cloned());
-        if terms.namespace.is_some() {
-            let path = Path::new(FLATPAK_NAMED_INSTALLATIONS);
-            match self.files.list(path) {
-                Ok(entries)
-                    if entries
-                        .iter()
-                        .any(|entry| entry.extension() == Some(OsStr::new("conf"))) =>
-                {
-                    self.scan.warnings.push(
-                        "named system Flatpak installations may share this application ID".into(),
-                    );
-                    return true;
-                }
-                Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                    self.warning(path, &error);
-                    return true;
-                }
-                _ => {}
-            }
-        }
         shared_inventory(app, inventory, terms)
     }
 
@@ -272,13 +345,16 @@ impl Scanner<'_> {
             let sandbox_data = paths.flatpak_data.join(namespace);
             match self.files.list(&sandbox_data) {
                 Ok(_) => {
-                    self.tree(
+                    self.add(
                         sandbox_data,
+                        Category::Directory,
                         MatchKind::ExactIdentity,
-                        "Flatpak application ID identifies the sandbox directory",
-                        &access,
+                        FLATPAK_DATA_REASON,
                         Risk::High,
-                    )?;
+                        Access::ReadOnly(
+                            "the sandbox directory needs verified pre-uninstall evidence".into(),
+                        ),
+                    );
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => self.warning(&sandbox_data, &error),
@@ -539,6 +615,44 @@ fn shared_inventory(app: &AppRecord, inventory: &Inventory, terms: &SearchTerms<
 mod tests {
     use super::*;
     use crate::inventory::record;
+
+    #[test]
+    fn portable_directory_requires_complete_inventory() {
+        let paths = LinuxPaths::from_home(PathBuf::from("/portable-test-home"));
+        let selected = paths.home.join("Applications/Editor");
+        let inventory = Inventory {
+            warnings: vec!["package inventory timed out".into()],
+            ..Inventory::default()
+        };
+        assert!(matches!(
+            require_portable_scope(&selected, &paths, &inventory),
+            Err(Error::Rejected(reason)) if reason.contains("inventory is incomplete")
+        ));
+    }
+
+    #[test]
+    fn portable_scope_preserves_app_collections_and_managed_trees() {
+        let mut paths = LinuxPaths::from_home(PathBuf::from("/portable-test-home"));
+        let inventory = Inventory::default();
+        let redirected = paths.home.join("redirected");
+        paths.desktop_dirs.push(redirected.join("desktop/managed"));
+        paths
+            .autostart_dirs
+            .push(redirected.join("autostart/managed"));
+        paths.service_dirs.push(redirected.join("service/managed"));
+        for name in ["desktop", "autostart", "service"] {
+            let parent = redirected.join(name);
+            let managed = parent.join("managed");
+            for selected in [parent, managed.join("vendor"), managed] {
+                assert!(require_portable_scope(&selected, &paths, &inventory).is_err());
+            }
+        }
+        for collection in &paths.appimages {
+            assert!(require_portable_scope(collection, &paths, &inventory).is_err());
+        }
+        let selected = paths.home.join("Applications/Editor");
+        assert!(require_portable_scope(&selected, &paths, &inventory).is_ok());
+    }
 
     #[test]
     fn user_and_system_flatpak_refs_share_one_data_directory() {

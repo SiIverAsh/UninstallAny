@@ -27,6 +27,8 @@ from typing import BinaryIO, Final
 PROJECT: Final = Path(__file__).resolve().parents[1]
 APP_NAME: Final = "UninstallAny"
 PACKAGE: Final = "uninstallany-gui"
+CLI_PACKAGE: Final = "uninstallany-cli"
+CLI_BINARY: Final = "uninstallany"
 BUNDLE_ID: Final = "io.github.siiverash.uninstallany"
 MACOS_MINIMUM: Final = "13.0"
 MACOS_BACKEND: Final = PROJECT / "crates" / "uninstallany-macos"
@@ -156,11 +158,11 @@ def _project_version() -> str:
 
 
 def _cargo_build(
-    triple: str, target: Target, *, macos_helper: bool = False
+    triple: str, target: Target, *, macos_helper: bool = False, cli: bool = False
 ) -> tuple[list[str], dict[str, str], Path]:
     env = os.environ.copy()
     build_dir = PROJECT / "target"
-    if target.system == "macos":
+    if target.system == "macos" and not cli:
         # Concurrent preview and signed builds must not replace each other's executable.
         build_dir /= "macos-host-with-helper" if macos_helper else "macos-host"
     elif target.system == "windows":
@@ -178,7 +180,9 @@ def _cargo_build(
     ]
     if target.system == "macos":
         env["MACOSX_DEPLOYMENT_TARGET"] = MACOS_MINIMUM
-    if target.system in {"macos", "windows"}:
+    if cli:
+        args.extend(("--package", CLI_PACKAGE, "--bin", CLI_BINARY))
+    elif target.system in {"macos", "windows"}:
         # Use the checked-in asset location and content security policy.
         env.pop("TAURI_CONFIG", None)
         args.extend(("--manifest-path", str(TAURI_MANIFEST), "--bin", TAURI_DESKTOP))
@@ -193,15 +197,15 @@ def _cargo_build(
     return args, env, build_dir / triple / "release"
 
 
-def _build(triple: str, target: Target) -> tuple[Path, Path | None]:
-    args, env, release = _cargo_build(triple, target)
+def _build(triple: str, target: Target, *, cli: bool = False) -> tuple[Path, Path | None]:
+    args, env, release = _cargo_build(triple, target, cli=cli)
     if triple == WINDOWS_DYNAMIC_TARGET:
         messages = _build_messages(args, env)
         return release / f"{TAURI_DESKTOP}.exe", _find_windows_loader(
             messages, release, target.arch
         )
     subprocess.run(args, cwd=PROJECT, env=env, check=True)
-    name = {
+    name = CLI_BINARY if cli else {
         "macos": TAURI_DESKTOP,
         "windows": f"{TAURI_DESKTOP}.exe",
         "linux": PACKAGE,
@@ -738,8 +742,10 @@ def _publish(
     *,
     windows_loader: Path | None = None,
     windows_webview: bool = False,
+    cli: bool = False,
 ) -> Path:
-    stem = f"{APP_NAME}-{version}-{target.system}-{target.arch}"
+    name = f"{APP_NAME}-CLI" if cli else APP_NAME
+    stem = f"{name}-{version}-{target.system}-{target.arch}"
     is_tar = target.system == "linux"
     suffix = ".tar.gz" if is_tar else ".zip"
     published = output / stem
@@ -766,15 +772,21 @@ def _publish(
             shutil.copyfile(windows_loader, staged_loader)
             with staged_loader.open("rb") as source:
                 _validate_windows_dll(source, target.machine)
-        members = _package_members(
-            staged_binary,
-            stage,
-            target,
-            version,
-            signing,
-            windows_loader=staged_loader,
-            windows_webview=windows_webview,
-        )
+        if cli:
+            members = [
+                Member("README.md", PROJECT / "docs" / "cli.md"),
+                Member(CLI_BINARY, staged_binary, PERM_EXECUTABLE),
+            ]
+        else:
+            members = _package_members(
+                staged_binary,
+                stage,
+                target,
+                version,
+                signing,
+                windows_loader=staged_loader,
+                windows_webview=windows_webview,
+            )
         if is_tar:
             _write_tar(archive, members)
         else:
@@ -795,6 +807,7 @@ def main() -> int:
     """Run the build, package validation and local publication."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=TARGETS)
+    parser.add_argument("--cli", action="store_true", help="package the macOS or Linux CLI")
     parser.add_argument(
         "--binary", type=Path, help="package a trusted prebuilt release binary"
     )
@@ -819,7 +832,9 @@ def main() -> int:
     try:
         triple = args.target or _native_target()
         target = TARGETS[triple]
-        if target.system == "macos" and platform.system() != "Darwin":
+        if args.cli and target.system == "windows":
+            raise PackageError("CLI packages are available for macOS and Linux.")
+        if not args.cli and target.system == "macos" and platform.system() != "Darwin":
             raise PackageError("Creating and verifying an app seal requires macOS.")
         signing: MacSigning | None = None
         identity: str | None = args.macos_signing_identity
@@ -827,6 +842,10 @@ def main() -> int:
         notary_profile: str | None = args.macos_notary_profile
         binary_input: Path | None = args.binary
         windows_loader: Path | None = args.windows_loader
+        if args.cli and any(
+            value is not None for value in (identity, supplied_helper, notary_profile)
+        ):
+            raise PackageError("macOS bundle signing options apply to the desktop app.")
         if windows_loader is not None and (
             target.system != "windows" or binary_input is None
         ):
@@ -851,7 +870,7 @@ def main() -> int:
                     "Helper binaries and notarization require --macos-signing-identity."
                 )
             if binary_input is None:
-                binary, windows_loader = _build(triple, target)
+                binary, windows_loader = _build(triple, target, cli=args.cli)
             else:
                 binary = binary_input.resolve()
         output = args.output_dir.resolve()
@@ -863,6 +882,7 @@ def main() -> int:
             signing,
             windows_loader=windows_loader,
             windows_webview=target.system == "windows" and binary_input is None,
+            cli=args.cli,
         )
     except (OSError, PackageError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Packaging failed: {error}\n")

@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    io,
+    fs::{File, Metadata},
+    io::{self, Read},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -60,6 +62,12 @@ impl CaskId {
         self.bundle_id.as_deref()
     }
 
+    pub(super) fn install_dir(&self) -> PathBuf {
+        Path::new(PREFIXES[self.prefix])
+            .join("Caskroom")
+            .join(&self.token)
+    }
+
     fn as_app_id(&self) -> AppId {
         AppId::Package {
             manager: MANAGER.into(),
@@ -84,6 +92,428 @@ struct Receipt {
 #[derive(Default, Deserialize)]
 struct Source {
     version: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemovalSnapshot {
+    version: Option<String>,
+    artifacts: Option<Vec<Value>>,
+    url_specs: Option<EmptyUrlSpecs>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyUrlSpecs {}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct UninstallEvidence {
+    pub(super) prefix: &'static str,
+    pub(super) token: String,
+    pub(super) cask_dir: PathBuf,
+    pub(super) snapshot_path: PathBuf,
+    pub(super) app_path: PathBuf,
+    pub(super) app_dir: PathBuf,
+    pub(super) staged_app: PathBuf,
+    pub(super) bundle_id: String,
+    pub(super) version: String,
+    pub(super) snapshot_digest: [u8; 32],
+    pub(super) receipt_digest: [u8; 32],
+    pub(super) config_digest: [u8; 32],
+    directories: Vec<RemovalStamp>,
+    app_directory: RemovalStamp,
+    app: RemovalStamp,
+    records: [RemovalStamp; 3],
+    staging_fingerprint: [u8; 32],
+    staged_link_identity: (u64, u64),
+    app_fingerprint: String,
+}
+
+impl UninstallEvidence {
+    pub(super) fn directory_identities(&self) -> [(u64, u64); 3] {
+        [&self.directories[0], &self.app, &self.app_directory]
+            .map(|stamp| (stamp.device, stamp.inode))
+    }
+
+    pub(super) fn staged_link_identity(&self) -> (u64, u64) {
+        self.staged_link_identity
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RemovalStamp {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl From<Metadata> for RemovalStamp {
+    fn from(metadata: Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            mode: metadata.mode(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+/// Binds one exact local cask installation and its app tree to native removal.
+pub(super) fn prepare_uninstall_evidence(
+    files: &UnixFiles,
+    home: &Path,
+    app: &AppRecord,
+    cancel: &Cancellation,
+) -> Result<UninstallEvidence> {
+    cancel.check()?;
+    let AppId::Package { manager, id } = &app.id else {
+        return Err(removal_rejected(
+            "the selected application is not a Homebrew cask",
+        ));
+    };
+    let id = CaskId::parse(id)
+        .filter(|id| manager == MANAGER && !app.system_component && id.as_app_id() == app.id)
+        .ok_or_else(|| removal_rejected("the selected Homebrew cask is ineligible"))?;
+    let (app_path, bundle_id) = app
+        .install_location
+        .as_deref()
+        .zip(id.bundle_id())
+        .ok_or_else(|| removal_rejected("the cask does not identify one installed bundle"))?;
+
+    let cask_dir = id.install_dir();
+    let cask_stamp = directory_stamp(files, &cask_dir)?;
+    let owner = directory_stamp(files, home)?.owner;
+    if owner == 0 || cask_stamp.owner != owner {
+        return Err(removal_rejected(
+            "the cask is not owned by the ordinary account",
+        ));
+    }
+    let room = Path::new(PREFIXES[id.prefix]).join("Caskroom");
+    require_listed_entry(files, &room, &cask_dir)?;
+
+    let metadata = cask_dir.join(METADATA_DIR);
+    let metadata_stamp = directory_stamp(files, &metadata)?;
+    let receipt_path = metadata.join(RECEIPT_FILE);
+    let config_path = metadata.join(CONFIG_FILE);
+    let (receipt_bytes, receipt_stamp) = read_removal_file(files, &receipt_path, owner)?;
+    let receipt: Receipt = decode_json(&receipt_bytes)?;
+    let version = receipt
+        .source
+        .version
+        .as_deref()
+        .filter(|version| {
+            !version.starts_with(['.', '-'])
+                && relative_path(version).is_some_and(|path| path.components().count() == 1)
+        })
+        .ok_or_else(|| removal_rejected("the cask receipt does not record one literal version"))?;
+    let artifact = removal_artifact(&receipt).ok_or_else(|| {
+        removal_rejected("the receipt must declare exactly one app without uninstall hooks")
+    })?;
+    let (source, target) = receipt_app_args(artifact)
+        .ok_or_else(|| removal_rejected("the receipt app declaration is invalid"))?;
+    let source = literal_app_name(source)
+        .ok_or_else(|| removal_rejected("the staged app must be a direct bundle"))?;
+
+    let (config_bytes, config_stamp) = read_removal_file(files, &config_path, owner)?;
+    let app_dir = recorded_removal_app_dir(&decode_json(&config_bytes)?, home)
+        .ok_or_else(|| removal_rejected("the saved cask config lacks an exact supported appdir"))?;
+    let target = target.unwrap_or(source);
+    let destination = if target.starts_with('/') {
+        resolve_directory(target, home)
+    } else {
+        literal_app_name(target).map(|name| app_dir.join(name))
+    };
+    if destination.as_deref().map(Path::as_os_str) != Some(app_path.as_os_str())
+        || app_path.parent() != Some(app_dir.as_path())
+        || !app_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| literal_app_name(name).is_some())
+    {
+        return Err(removal_rejected(
+            "the saved app destination differs from the exact selected bundle",
+        ));
+    }
+    require_listed_entry(files, &app_dir, app_path)?;
+    let app_stamp = directory_stamp(files, app_path)?;
+    let bundle = bundle::read(files, app_path)?;
+    if app_stamp.owner != owner || bundle.is_system() || bundle.identifier != bundle_id {
+        return Err(removal_rejected("the cask app bundle identifier changed"));
+    }
+
+    let version_dir = metadata.join(version);
+    let staged_dir = cask_dir.join(version);
+    let timestamp_dir = singleton_child(files, &version_dir)?;
+    if timestamp_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(installation_date)
+        .is_none()
+    {
+        return Err(removal_rejected(
+            "the cask has no exact timestamped install snapshot",
+        ));
+    }
+    let definitions = timestamp_dir.join("Casks");
+    let snapshot_path = definitions.join(format!("{}.json", id.token));
+    let staged_app = staged_dir.join(source);
+    let directories = [
+        &cask_dir,
+        &metadata,
+        &version_dir,
+        &timestamp_dir,
+        &definitions,
+        &staged_dir,
+    ];
+    let directory_stamps = directories
+        .iter()
+        .map(|path| directory_stamp(files, path))
+        .collect::<io::Result<Vec<_>>>()?;
+    if directory_stamps.iter().any(|entry| entry.owner != owner) {
+        return Err(removal_rejected(
+            "the cask's local metadata or staging folders have foreign ownership",
+        ));
+    }
+    let app_directory = directory_stamp(files, &app_dir)?;
+
+    require_exact_children(files, &cask_dir, &[&metadata, &staged_dir])?;
+    require_exact_children(
+        files,
+        &metadata,
+        &[&receipt_path, &config_path, &version_dir],
+    )?;
+    require_exact_children(files, &version_dir, &[&timestamp_dir])?;
+    require_exact_children(files, &timestamp_dir, &[&definitions])?;
+    require_exact_children(files, &definitions, &[&snapshot_path])?;
+
+    let (snapshot_bytes, snapshot_stamp) = read_removal_file(files, &snapshot_path, owner)?;
+    let snapshot: RemovalSnapshot = decode_json(&snapshot_bytes)?;
+    // Homebrew stages the snapshot, saves the config, then records the receipt.
+    // Matching version text alone would also accept metadata from a reinstall.
+    if snapshot
+        .version
+        .as_deref()
+        .is_some_and(|observed| observed != version)
+        || snapshot
+            .artifacts
+            .as_deref()
+            .is_some_and(|saved| receipt.uninstall_artifacts.as_deref() != Some(saved))
+        || snapshot.url_specs.is_some()
+        || snapshot_stamp.modified >= config_stamp.modified
+        || config_stamp.modified >= receipt_stamp.modified
+    {
+        return Err(removal_rejected(
+            "the cask receipt, configuration, and snapshot must match one installation",
+        ));
+    }
+
+    let staged_link_identity = require_staged_link(files, &staged_app, app_path)?;
+    let staging_fingerprint = files.fingerprint_macos_homebrew_staging(&staged_app)?;
+    let app_fingerprint = files.fingerprint_macos_homebrew_application(app_path)?;
+    cancel.check()?;
+    if directory_stamps[0] != cask_stamp
+        || directory_stamps[1] != metadata_stamp
+        || directory_stamp(files, &app_dir)? != app_directory
+        || directory_stamp(files, app_path)? != app_stamp
+        || bundle::read(files, app_path)?.identifier != bundle_id
+    {
+        return Err(removal_rejected(
+            "the cask installation changed during review",
+        ));
+    }
+    for (path, stamp) in directories.iter().zip(&directory_stamps) {
+        if directory_stamp(files, path)? != *stamp {
+            return Err(removal_rejected(
+                "the cask directories changed during review",
+            ));
+        }
+    }
+    for (path, expected) in [
+        (&receipt_path, &receipt_stamp),
+        (&config_path, &config_stamp),
+        (&snapshot_path, &snapshot_stamp),
+    ] {
+        if RemovalStamp::from(files.open_macos_homebrew_regular_file(path)?.metadata()?)
+            != *expected
+        {
+            return Err(removal_rejected("the cask metadata changed during review"));
+        }
+    }
+    if require_staged_link(files, &staged_app, app_path)? != staged_link_identity {
+        return Err(removal_rejected(
+            "the staged app link changed during review",
+        ));
+    }
+
+    Ok(UninstallEvidence {
+        prefix: PREFIXES[id.prefix],
+        token: id.token.clone(),
+        cask_dir,
+        snapshot_path,
+        app_path: app_path.into(),
+        app_dir,
+        staged_app,
+        bundle_id: bundle_id.into(),
+        version: version.into(),
+        snapshot_digest: Sha256::digest(snapshot_bytes).into(),
+        receipt_digest: Sha256::digest(receipt_bytes).into(),
+        config_digest: Sha256::digest(config_bytes).into(),
+        directories: directory_stamps,
+        app_directory,
+        app: app_stamp,
+        records: [receipt_stamp, config_stamp, snapshot_stamp],
+        staging_fingerprint,
+        staged_link_identity,
+        app_fingerprint,
+    })
+}
+
+fn removal_artifact(receipt: &Receipt) -> Option<&Value> {
+    if receipt.uninstall_flight_blocks != Some(false) {
+        return None;
+    }
+    let mut app = None;
+    let mut has_zap = false;
+    for artifact in receipt.uninstall_artifacts.as_deref()? {
+        if artifact.as_object()?.len() != 1 {
+            return None;
+        }
+        match named_artifact(artifact)? {
+            ("app", _) if app.is_none() => {
+                receipt_app_args(artifact)?;
+                app = Some(artifact);
+            }
+            // Only the selected app is passed to Homebrew's native action.
+            ("zap", args) if !has_zap && declarative_zap(args) => has_zap = true,
+            _ => return None,
+        }
+    }
+    app
+}
+
+fn declarative_zap(args: &Value) -> bool {
+    let Some([Value::Object(options)]) = args.as_array().map(Vec::as_slice) else {
+        return false;
+    };
+    !options.is_empty()
+        && options.iter().all(|(key, value)| {
+            matches!(key.as_str(), "trash" | "delete" | "rmdir")
+                && (value.is_string()
+                    || value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(Value::is_string)))
+        })
+}
+
+fn literal_app_name(name: &str) -> Option<&str> {
+    let path = relative_path(name)?;
+    (!name.starts_with(['.', '~']) && path.components().count() == 1 && bundle::is_app(path))
+        .then_some(name)
+}
+
+fn recorded_removal_app_dir(config: &Value, home: &Path) -> Option<PathBuf> {
+    for scope in ["explicit", "env", "default"] {
+        let Some(directory) = config.get(scope)?.as_object()?.get("appdir") else {
+            continue;
+        };
+        let literal = directory.as_str()?;
+        let path = resolve_directory(literal, home)?;
+        let eligible = path.as_os_str() == OsStr::new(literal)
+            && (path == Path::new(SYSTEM_APPLICATIONS) || path == home.join("Applications"));
+        return eligible.then_some(path);
+    }
+    None
+}
+
+fn read_removal_file(
+    files: &UnixFiles,
+    path: &Path,
+    owner: u32,
+) -> io::Result<(Vec<u8>, RemovalStamp)> {
+    let mut file = files.open_macos_homebrew_regular_file(path)?;
+    let expected = RemovalStamp::from(file.metadata()?);
+    if expected.owner != owner {
+        return Err(invalid_metadata(
+            "the cask metadata must belong to the ordinary account",
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_METADATA_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_METADATA_BYTES || expected != RemovalStamp::from(file.metadata()?) {
+        return Err(invalid_metadata(
+            "the cask metadata is oversized or changed during review",
+        ));
+    }
+    Ok((bytes, expected))
+}
+
+fn directory_stamp(files: &UnixFiles, path: &Path) -> io::Result<RemovalStamp> {
+    let directory = File::from(files.open_macos_homebrew_directory(path)?);
+    Ok(directory.metadata()?.into())
+}
+
+fn require_listed_entry(files: &UnixFiles, parent: &Path, expected: &Path) -> Result<()> {
+    if !files
+        .list(parent)?
+        .iter()
+        .any(|path| path.as_os_str() == expected.as_os_str())
+    {
+        return Err(removal_rejected(
+            "the installation entry is absent or has different spelling",
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_children(files: &UnixFiles, parent: &Path, expected: &[&Path]) -> Result<()> {
+    let actual = files.list(parent)?;
+    if actual.len() != expected.len()
+        || actual.iter().any(|entry| {
+            !expected
+                .iter()
+                .any(|path| entry.as_os_str() == path.as_os_str())
+        })
+    {
+        return Err(removal_rejected(
+            "the cask has extra or unverified files within its uninstall scope",
+        ));
+    }
+    Ok(())
+}
+
+fn singleton_child(files: &UnixFiles, parent: &Path) -> Result<PathBuf> {
+    let mut entries = files.list(parent)?;
+    if entries.len() != 1 {
+        return Err(removal_rejected(
+            "the cask must have a single installed snapshot",
+        ));
+    }
+    entries
+        .pop()
+        .ok_or_else(|| removal_rejected("the cask install snapshot is missing"))
+}
+
+fn require_staged_link(files: &UnixFiles, path: &Path, app: &Path) -> Result<(u64, u64)> {
+    files
+        .read_macos_homebrew_symlink(path)?
+        .filter(|(target, _)| target.as_os_str() == app.as_os_str())
+        .map(|(_, identity)| identity)
+        .ok_or_else(|| {
+            removal_rejected("the staged app link does not identify the exact installed bundle")
+        })
+}
+
+fn removal_rejected(message: &str) -> Error {
+    Error::Rejected(message.into())
 }
 
 #[derive(Default, Deserialize)]
@@ -113,6 +543,7 @@ struct Snapshot {
     install_date: Option<String>,
     definition: Definition,
     internal: bool,
+    native_removal_shape: bool,
 }
 
 struct StagedSnapshot {
@@ -260,6 +691,7 @@ pub(super) struct Cask {
     install_date: Option<String>,
     app_targets: BTreeSet<PathBuf>,
     unresolved_app_target: bool,
+    native_removal_shape: bool,
 }
 
 impl Cask {
@@ -268,6 +700,10 @@ impl Cask {
             return None;
         }
         self.app_targets.first().map(PathBuf::as_path)
+    }
+
+    pub(super) fn supports_native_removal(&self) -> bool {
+        self.native_removal_shape && self.path().is_some()
     }
 
     pub(super) fn app_paths(&self) -> impl Iterator<Item = &Path> {
@@ -397,8 +833,18 @@ fn read(
         return Ok(None);
     };
     let CaskMetadata {
-        receipt, snapshot, ..
+        receipt,
+        snapshot,
+        config,
+        ..
     } = metadata;
+    let native_removal_shape = matches!(config, CaskConfig::RecordedAppDir(_))
+        && receipt
+            .as_ref()
+            .is_some_and(|receipt| removal_artifact(receipt).is_some())
+        && snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.native_removal_shape);
     let version = snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.version.clone())
@@ -409,6 +855,7 @@ fn read(
         install_date: snapshot.and_then(|snapshot| snapshot.install_date),
         app_targets: evidence.targets,
         unresolved_app_target: evidence.invalid || !evidence.observed,
+        native_removal_shape,
     }))
 }
 
@@ -657,7 +1104,7 @@ fn read_snapshot(
             .map(|version| StagedSnapshot {
                 version: version.into(),
                 definition_path: path,
-                definition_digest: Sha256::digest(bytes).into(),
+                definition_digest: Sha256::digest(&bytes).into(),
             });
         return Ok(Some(Snapshot {
             version,
@@ -665,6 +1112,7 @@ fn read_snapshot(
             install_date,
             definition,
             internal,
+            native_removal_shape: !internal && decode_json::<RemovalSnapshot>(&bytes).is_ok(),
         }));
     }
     let ruby_path = casks.join(format!("{token}.rb"));
@@ -675,6 +1123,7 @@ fn read_snapshot(
             install_date,
             definition: Definition::default(),
             internal: false,
+            native_removal_shape: false,
         })),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),

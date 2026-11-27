@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use uninstallany_core::{AppRecord, Cancellation, Inventory, Result};
+use uninstallany_core::{Access, AppRecord, Cancellation, FileStore, Inventory, Result};
 use uninstallany_unix::UnixFiles;
 
 use crate::{
@@ -13,10 +13,10 @@ use crate::{
     paths::LinuxPaths,
 };
 
-const DESKTOP_MAX_BYTES: usize = 128 * 1024;
+pub(crate) const DESKTOP_MAX_BYTES: usize = 128 * 1024;
 const MAX_ENTRIES_PER_SOURCE: usize = 5_000;
 const ELF_HEADER: &[u8] = b"\x7fELF";
-const APPIMAGE_HEADER_SIZE: usize = 11;
+pub(crate) const APPIMAGE_HEADER_SIZE: usize = 11;
 
 #[derive(Debug)]
 pub(crate) struct Launcher {
@@ -83,6 +83,9 @@ fn read_appimages(
             };
             inventory.applications.push(AppRecord {
                 install_location: Some(path.clone()),
+                official_uninstall_available: files
+                    .inspect_file(&path)
+                    .is_ok_and(|inspection| inspection.access == Access::Allowed),
                 ..record(Source::AppImage, identity, name)
             });
         }

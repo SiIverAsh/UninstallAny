@@ -243,7 +243,7 @@ enum Walk<'a> {
     Capture {
         entries: &'a mut Vec<String>,
         digest: &'a mut Sha256,
-        tree: Tree,
+        tree: Tree<'static>,
     },
     Verify(&'a [String]),
     Remove(&'a [String]),

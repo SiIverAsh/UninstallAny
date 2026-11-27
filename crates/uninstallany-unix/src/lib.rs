@@ -14,7 +14,6 @@ mod store;
 mod trash;
 
 use std::ffi::OsStr;
-#[cfg(target_os = "macos")]
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
@@ -88,6 +87,8 @@ pub struct UnixFiles {
     state: PathBuf,
     home: PathBuf,
     uid: u32,
+    #[cfg(target_os = "linux")]
+    flatpak_data_root: Option<PathBuf>,
     #[cfg(target_os = "macos")]
     application_roots: Vec<PathBuf>,
     #[cfg(target_os = "macos")]
@@ -161,6 +162,8 @@ impl UnixFiles {
             state,
             home,
             uid,
+            #[cfg(target_os = "linux")]
+            flatpak_data_root: None,
             #[cfg(target_os = "macos")]
             application_roots: Vec::new(),
             #[cfg(target_os = "macos")]
@@ -178,6 +181,20 @@ impl UnixFiles {
             #[cfg(target_os = "macos")]
             http_storage_root: None,
         })
+    }
+
+    /// Enables quarantine of direct Flatpak app data directories under the account home.
+    /// The Linux backend must separately verify that each directory belongs to the app.
+    #[cfg(target_os = "linux")]
+    pub fn with_linux_flatpak_data_directories(mut self, root: &Path) -> io::Result<Self> {
+        let expected = self.home.join(".var/app");
+        if root.as_os_str() != expected.as_os_str() || self.scope(root)? != root {
+            return Err(deny(
+                "the Flatpak data folder must be an exact discovery root",
+            ));
+        }
+        self.flatpak_data_root = Some(root.to_path_buf());
+        Ok(self)
     }
 
     /// Allows standalone `.app` bundles only as direct children of existing discovery roots.
@@ -224,7 +241,9 @@ impl UnixFiles {
         self.protected_nodes = self
             .protected
             .iter()
-            .filter(|path| *path != &root)
+            // Mutation checks track the state separately so the journal can
+            // still open its own directory.
+            .filter(|path| *path != &root && *path != &self.state)
             .filter_map(|path| native::protected_id(path).ok())
             .collect();
         self.launch_agent_root = Some(root);
@@ -350,6 +369,141 @@ impl UnixFiles {
         Ok(directory)
     }
 
+    /// Opens an ordinary cask directory for read-only native uninstall review.
+    /// Only the standard Caskroom, Applications and Homebrew `bin` boundaries
+    /// allow admin-group writes.
+    #[cfg(target_os = "macos")]
+    pub fn open_macos_homebrew_directory(&self, path: &Path) -> io::Result<OwnedFd> {
+        let shared_root = [
+            "/opt/homebrew/Caskroom",
+            "/usr/local/Caskroom",
+            "/Applications",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+        ]
+        .into_iter()
+        .map(Path::new)
+        .find(|root| path.starts_with(root));
+        let Some(root) = shared_root else {
+            return self.open_trusted_local_directory(path);
+        };
+        if is_homebrew_bin(root) && path != root {
+            return Err(deny(
+                "Homebrew review only opens the fixed launcher in its bin directory",
+            ));
+        }
+        let scoped = self.open_scoped_directory(path)?;
+        let parent = if root == Path::new("/Applications") {
+            // `/` is outside the caller's application discovery roots.
+            let (parent, trusted) = native::open_trusted_path(Path::new("/"), self.uid, &[], None)?;
+            if !trusted {
+                return Err(deny("the system Applications parent is untrusted"));
+            }
+            parent
+        } else {
+            self.open_trusted_local_directory(parent_path(root)?)?
+        };
+        let mut current = native::open_subdirectory(&parent, filename(root)?)?;
+        let stat = fs::fstat(&current)?;
+        const DARWIN_ADMIN_GID: u32 = 80;
+        let safe_shared_mode = stat.st_mode & 0o002 == 0
+            && (stat.st_mode & 0o020 == 0 || stat.st_gid == DARWIN_ADMIN_GID);
+        if !safe_shared_mode
+            || (stat.st_uid != 0 && stat.st_uid != self.uid)
+            || native::acl_allows_mutation(&current)?
+        {
+            return Err(deny(
+                "the Homebrew or Applications boundary allows unrelated writes",
+            ));
+        }
+        native::require_local(&current)?;
+        let relative = path.strip_prefix(root).map_err(io::Error::other)?;
+        for component in relative.components() {
+            current = native::open_subdirectory(&current, component.as_os_str())?;
+            native::require_current_user_directory(&current, self.uid)?;
+            native::reject_protected(&current, &self.protected_nodes)?;
+            self.reject_state_alias(&current)?;
+        }
+        if native::directory_id(&scoped)? != native::directory_id(&current)? {
+            return Err(deny(
+                "the Homebrew discovery directory changed during verification",
+            ));
+        }
+        Ok(current)
+    }
+
+    /// Pins ordinary metadata in the read-only Homebrew review scope.
+    #[cfg(target_os = "macos")]
+    pub fn open_macos_homebrew_regular_file(&self, path: &Path) -> io::Result<File> {
+        self.scope(path)?;
+        let directory = parent_path(path)?;
+        let name = filename(path)?;
+        if is_homebrew_bin(directory) && name != "brew" {
+            return Err(deny(
+                "only the fixed Homebrew launcher is eligible in its bin directory",
+            ));
+        }
+        let parent = self.open_macos_homebrew_directory(directory)?;
+        let (file, _) = self.open_trusted_regular_at(&parent, name)?;
+        Ok(file)
+    }
+
+    /// Fingerprints the private native staging tree, including its exact app link.
+    #[cfg(target_os = "macos")]
+    pub fn fingerprint_macos_homebrew_staging(&self, staged_app: &Path) -> io::Result<[u8; 32]> {
+        let staged = parent_path(staged_app)?;
+        let cask = parent_path(staged)?;
+        let room = parent_path(cask)?;
+        if !matches!(
+            room.to_str(),
+            Some("/opt/homebrew/Caskroom" | "/usr/local/Caskroom")
+        ) || !is_bundle_name(staged_app)
+        {
+            return Err(deny(
+                "the app link must be within its standard Homebrew cask staging directory",
+            ));
+        }
+        let parent = self.open_macos_homebrew_directory(cask)?;
+        native::cask_staging_stamp(&parent, filename(staged)?, filename(staged_app)?, self.uid)
+    }
+
+    /// Captures a current-user app tree for Homebrew review without enabling quarantine.
+    #[cfg(target_os = "macos")]
+    pub fn fingerprint_macos_homebrew_application(&self, path: &Path) -> io::Result<String> {
+        self.check_mutation_path(path)?;
+        let app_dir = parent_path(path)?;
+        if !self.is_application_bundle(path)
+            || (app_dir != Path::new("/Applications") && app_dir != self.home.join("Applications"))
+        {
+            return Err(deny("Homebrew app review requires one direct application"));
+        }
+        let parent = self.open_macos_homebrew_directory(app_dir)?;
+        let parent_id = native::directory_id(&parent)?;
+        let name = filename(path)?;
+        let stat = native::entry_stat(&parent, name)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(deny(
+                "the reviewed Homebrew app must be an ordinary directory",
+            ));
+        }
+        native::reject_protected_entry(&stat, &self.protected_nodes)?;
+        native::reject_protected_entry(&stat, self.state_node.as_slice())?;
+        let observed = self.observe_entry(&parent, name, path)?;
+        let current = self.open_macos_homebrew_directory(app_dir)?;
+        if observed.metadata != EntryStamp::from_stat(&stat)
+            || native::directory_id(&current)? != parent_id
+            || observed.metadata != EntryStamp::from_stat(&native::entry_stat(&current, name)?)
+        {
+            return Err(deny("the Homebrew app changed during verification"));
+        }
+        serde_json::to_string(&Fingerprint {
+            path: path.as_os_str().as_bytes().to_vec(),
+            parent: parent_id,
+            entry: observed,
+        })
+        .map_err(io::Error::other)
+    }
+
     /// Pins a trusted regular file for descriptor-based identity verification.
     #[cfg(target_os = "macos")]
     pub fn open_trusted_local_regular_file(&self, path: &Path) -> io::Result<File> {
@@ -451,7 +605,6 @@ impl UnixFiles {
 
     /// Checks one name for absence in a held local directory without following links.
     /// A missing parent remains an error so callers can verify its scope separately.
-    #[cfg(target_os = "macos")]
     pub fn local_entry_absent(&self, path: &Path) -> io::Result<bool> {
         self.scope(path)?;
         let parent = parent_path(path)?;
@@ -516,9 +669,31 @@ impl UnixFiles {
     /// discovery evidence only and its destination is never opened here.
     #[cfg(target_os = "macos")]
     pub fn read_discovery_symlink(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        self.read_local_symlink(path, Self::open_trusted_local_directory)
+            .map(|entry| entry.map(|(target, _)| target))
+    }
+
+    /// Reads one Homebrew symlink and its device/inode without resolving the target.
+    #[cfg(target_os = "macos")]
+    pub fn read_macos_homebrew_symlink(
+        &self,
+        path: &Path,
+    ) -> io::Result<Option<(PathBuf, (u64, u64))>> {
+        if is_homebrew_bin(parent_path(path)?) {
+            return Err(deny("the fixed Homebrew launcher must be a regular file"));
+        }
+        self.read_local_symlink(path, Self::open_macos_homebrew_directory)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_local_symlink(
+        &self,
+        path: &Path,
+        open_parent: impl Fn(&Self, &Path) -> io::Result<OwnedFd>,
+    ) -> io::Result<Option<(PathBuf, (u64, u64))>> {
         self.scope(path)?;
         let parent_path = parent_path(path)?;
-        let parent = match self.open_trusted_local_directory(parent_path) {
+        let parent = match open_parent(self, parent_path) {
             Ok(parent) => parent,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -551,7 +726,7 @@ impl UnixFiles {
                 "the discovery symlink has empty or oversized target text",
             ));
         }
-        let current_parent = self.open_trusted_local_directory(parent_path)?;
+        let current_parent = open_parent(self, parent_path)?;
         let observed = native::entry_stat(&current_parent, name)?;
         if native::directory_id(&current_parent)? != parent_identity
             || EntryStamp::from_stat(&entry) != EntryStamp::from_stat(&observed)
@@ -561,7 +736,11 @@ impl UnixFiles {
                 "the discovery symlink changed while reading its target text",
             ));
         }
-        Ok(Some(PathBuf::from(OsStr::from_bytes(&target[..length]))))
+        let identity = NodeId::from_stat(&entry);
+        Ok(Some((
+            PathBuf::from(OsStr::from_bytes(&target[..length])),
+            (identity.device, identity.inode),
+        )))
     }
 
     /// Reads a private user LaunchAgent and binds its bytes to the approval fingerprint.
@@ -620,6 +799,28 @@ impl UnixFiles {
         path: &Path,
         max_bytes: usize,
     ) -> io::Result<(Vec<u8>, Inspection)> {
+        let (inspection, bytes) = self.inspect_regular_with_prefix(path, max_bytes)?;
+        Ok((bytes, inspection))
+    }
+
+    /// Reads at most `max_bytes` from the guarded regular file being inspected.
+    /// Both the descriptor and its original name must match the approval fingerprint.
+    pub fn inspect_regular_with_prefix(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> io::Result<(Inspection, Vec<u8>)> {
+        let (inspection, bytes, _) = self.pin_regular_with_prefix(path, max_bytes)?;
+        Ok((inspection, bytes))
+    }
+
+    /// Returns the inspection, prefix, and open read-only file it verified.
+    /// The file cursor is positioned immediately after the prefix.
+    pub fn pin_regular_with_prefix(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> io::Result<(Inspection, Vec<u8>, File)> {
         if max_bytes > MAX_METADATA_BYTES {
             return Err(invalid("metadata read exceeds the discovery byte limit"));
         }
@@ -627,26 +828,63 @@ impl UnixFiles {
         let name = filename(path)?;
         let mut file = checked_file(&parent, name)?;
         let original = EntryStamp::from_stat(&fs::fstat(&file)?);
+        let fingerprint = self.fingerprint(path, &parent)?;
+        if original != fingerprint.entry.metadata {
+            return Err(deny("the regular file changed before reading its prefix"));
+        }
+
         let mut bytes = Vec::new();
         (&mut file).take(max_bytes as u64).read_to_end(&mut bytes)?;
-        let fingerprint = self.fingerprint(path, &parent)?;
         let current_parent = self.mutable_parent(path)?;
         // The evidence and the approval must identify the file we opened,
         // even if the enclosing directory was renamed during the read.
-        if original != fingerprint.entry.metadata
-            || original != EntryStamp::from_stat(&fs::fstat(&file)?)
+        if original != EntryStamp::from_stat(&fs::fstat(&file)?)
             || native::directory_id(&current_parent)? != fingerprint.parent
             || original != EntryStamp::from_stat(&native::entry_stat(&current_parent, name)?)
+            || native::mount_id(&current_parent, name, fs::AtFlags::SYMLINK_NOFOLLOW)?
+                != fingerprint.parent.mount
         {
             return Err(deny("the regular file changed while reading its prefix"));
         }
         self.validate_store_volume(fingerprint.parent, &self.store_anchor()?)?;
         Ok((
-            bytes,
             Inspection {
                 fingerprint: serde_json::to_string(&fingerprint).map_err(io::Error::other)?,
                 access: Access::Allowed,
             },
+            bytes,
+            file,
+        ))
+    }
+
+    /// Pins the exact Flatpak data directory inspected for a reversible move.
+    /// The held descriptor supplies the same inode as the returned approval evidence.
+    #[cfg(target_os = "linux")]
+    pub fn pin_linux_flatpak_data_directory(&self, path: &Path) -> io::Result<(Inspection, File)> {
+        if !self.is_linux_flatpak_data_directory(path) {
+            return Err(deny("the path is outside the exact Flatpak app data scope"));
+        }
+        let parent = self.mutable_parent(path)?;
+        let (fingerprint, directory) = self.open_linux_flatpak_data_at(path, &parent)?;
+        self.validate_store_volume(fingerprint.parent, &self.store_anchor()?)?;
+        let current = self.mutable_parent(path)?;
+        let name = filename(path)?;
+        if native::directory_id(&current)? != fingerprint.parent
+            || native::directory_id(&directory)?.mount != fingerprint.parent.mount
+            || native::mount_id(&current, name, fs::AtFlags::SYMLINK_NOFOLLOW)?
+                != fingerprint.parent.mount
+            || EntryStamp::from_stat(&fs::fstat(&directory)?) != fingerprint.entry.metadata
+            || EntryStamp::from_stat(&native::entry_stat(&current, name)?)
+                != fingerprint.entry.metadata
+        {
+            return Err(deny("the Flatpak data directory changed during inspection"));
+        }
+        Ok((
+            Inspection {
+                fingerprint: serde_json::to_string(&fingerprint).map_err(io::Error::other)?,
+                access: Access::Allowed,
+            },
+            File::from(directory),
         ))
     }
 
@@ -856,6 +1094,16 @@ impl UnixFiles {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn is_linux_flatpak_data_directory(&self, path: &Path) -> bool {
+        let (Some(root), Some(name)) = (self.flatpak_data_root.as_deref(), path.file_name()) else {
+            return false;
+        };
+        path.parent() == Some(root)
+            && path.as_os_str() == root.join(name).as_os_str()
+            && name.to_str().is_some_and(is_flatpak_app_id)
+    }
+
     #[cfg(target_os = "macos")]
     fn is_application_bundle(&self, path: &Path) -> bool {
         is_bundle_name(path)
@@ -1032,6 +1280,12 @@ impl UnixFiles {
     }
 
     fn fingerprint(&self, path: &Path, parent: &OwnedFd) -> io::Result<Fingerprint> {
+        #[cfg(target_os = "linux")]
+        if self.is_linux_flatpak_data_directory(path) {
+            return self
+                .open_linux_flatpak_data_at(path, parent)
+                .map(|(fingerprint, _)| fingerprint);
+        }
         let name = filename(path)?;
         let entry = native::entry_stat(parent, name)?;
         native::reject_protected_entry(&entry, &self.protected_nodes)?;
@@ -1090,6 +1344,34 @@ impl UnixFiles {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    fn open_linux_flatpak_data_at(
+        &self,
+        path: &Path,
+        parent: &OwnedFd,
+    ) -> io::Result<(Fingerprint, OwnedFd)> {
+        let name = filename(path)?;
+        let stat = native::entry_stat(parent, name)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(deny("the Flatpak data path must be an ordinary directory"));
+        }
+        native::reject_protected_entry(&stat, &self.protected_nodes)?;
+        native::reject_protected_entry(&stat, self.state_node.as_slice())?;
+        let metadata = EntryStamp::from_stat(&stat);
+        let parent_id = native::directory_id(parent)?;
+        let (tree, directory) =
+            native::flatpak_tree_stamp(parent, name, self.uid, &metadata, &self.protected_nodes)?;
+        let fingerprint = Fingerprint {
+            path: path.as_os_str().as_bytes().to_vec(),
+            parent: parent_id,
+            entry: VerifiedEntry {
+                metadata,
+                flatpak_tree: Some(tree),
+            },
+        };
+        Ok((fingerprint, directory))
+    }
+
     fn observe_entry(
         &self,
         parent: &OwnedFd,
@@ -1126,8 +1408,25 @@ impl UnixFiles {
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        let flatpak_tree = if FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+            && self.is_linux_flatpak_data_directory(_original)
+        {
+            let (tree, _) = native::flatpak_tree_stamp(
+                parent,
+                name,
+                self.uid,
+                &metadata,
+                &self.protected_nodes,
+            )?;
+            Some(tree)
+        } else {
+            None
+        };
         Ok(VerifiedEntry {
             metadata,
+            #[cfg(target_os = "linux")]
+            flatpak_tree,
             #[cfg(target_os = "macos")]
             bundle,
             #[cfg(target_os = "macos")]
@@ -1181,8 +1480,7 @@ impl UnixFiles {
         Ok(parent)
     }
 
-    /// Verifies that this exact macOS object was moved from its slot to its source.
-    #[cfg(target_os = "macos")]
+    /// Verifies that this exact quarantined object was moved back to its source.
     pub fn verify_file_restored(
         &self,
         path: &Path,
@@ -1190,6 +1488,7 @@ impl UnixFiles {
         slot: Uuid,
     ) -> io::Result<bool> {
         let expected = Fingerprint::decode(expected, path)?;
+        #[cfg(target_os = "macos")]
         if self
             .read(slot, Artifact::QuarantinePurgeCommitted)?
             .is_some()
@@ -1217,12 +1516,17 @@ impl UnixFiles {
             Err(error) => return Err(error),
         };
         self.validate_store_volume(observed.parent, &quarantine)?;
+        let slot_name = slot.to_string();
         let slots_absent = || -> io::Result<bool> {
-            Ok(quarantine_name_absent(&quarantine, &slot.to_string())?
-                && quarantine_name_absent(
-                    &quarantine,
-                    &directory_disposal::disposing_slot_name(slot),
-                )?)
+            if !quarantine_name_absent(&quarantine, &slot_name)? {
+                return Ok(false);
+            }
+            #[cfg(target_os = "macos")]
+            if !quarantine_name_absent(&quarantine, &directory_disposal::disposing_slot_name(slot))?
+            {
+                return Ok(false);
+            }
+            Ok(true)
         };
         if !slots_absent()? {
             return Ok(false);
@@ -1232,12 +1536,20 @@ impl UnixFiles {
         native::sync_move(&quarantine, &parent)?;
         let current = self.mutable_parent(path)?;
         let entry = native::entry_stat(&current, filename(path)?)?;
-        Ok(native::directory_id(&current)? == observed.parent
-            && EntryStamp::from_stat(&entry) == observed.entry.metadata
-            && slots_absent()?
-            && self
-                .read(slot, Artifact::QuarantinePurgeCommitted)?
-                .is_none())
+        if native::directory_id(&current)? != observed.parent
+            || EntryStamp::from_stat(&entry) != observed.entry.metadata
+            || !slots_absent()?
+        {
+            return Ok(false);
+        }
+        #[cfg(target_os = "macos")]
+        if self
+            .read(slot, Artifact::QuarantinePurgeCommitted)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
@@ -1604,7 +1916,6 @@ fn uncertain_move(reason: impl Into<String>) -> io::Error {
     ))
 }
 
-#[cfg(target_os = "macos")]
 fn quarantine_name_absent(parent: &OwnedFd, name: &str) -> io::Result<bool> {
     match native::entry_stat(parent, OsStr::new(name)) {
         Ok(_) => Ok(false),
@@ -1633,6 +1944,9 @@ impl Fingerprint {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct VerifiedEntry {
     metadata: EntryStamp,
+    #[cfg(target_os = "linux")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    flatpak_tree: Option<[u8; 32]>,
     #[cfg(target_os = "macos")]
     bundle: Option<[u8; 32]>,
     #[cfg(target_os = "macos")]
@@ -1642,6 +1956,10 @@ struct VerifiedEntry {
 
 impl VerifiedEntry {
     fn matches_moved(&self, other: &Self) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.flatpak_tree != other.flatpak_tree {
+            return false;
+        }
         #[cfg(target_os = "macos")]
         if self.bundle != other.bundle || self.launch_agent_digest != other.launch_agent_digest {
             return false;
@@ -1650,10 +1968,39 @@ impl VerifiedEntry {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn is_flatpak_app_id(name: &str) -> bool {
+    const MAX_ID_BYTES: usize = 255;
+    let Some((namespace, application)) = name.rsplit_once('.') else {
+        return false;
+    };
+    name.len() <= MAX_ID_BYTES
+        && namespace.contains('.')
+        && namespace
+            .split('.')
+            .all(|part| is_flatpak_id_part(part, false))
+        && is_flatpak_id_part(application, true)
+}
+
+#[cfg(target_os = "linux")]
+fn is_flatpak_id_part(part: &str, allows_dash: bool) -> bool {
+    let mut bytes = part.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || allows_dash && byte == b'-')
+}
+
 #[cfg(target_os = "macos")]
 fn is_bundle_name(path: &Path) -> bool {
     path.extension()
         .is_some_and(|suffix| suffix.as_bytes().eq_ignore_ascii_case(b"app"))
+}
+
+#[cfg(target_os = "macos")]
+fn is_homebrew_bin(path: &Path) -> bool {
+    matches!(path.to_str(), Some("/opt/homebrew/bin" | "/usr/local/bin"))
 }
 
 /// Recognizes a literal `.app` one suite directory below an Applications root.
@@ -1823,3 +2170,37 @@ fn probe_discovery_entry(parent: &OwnedFd, path: &Path) -> io::Result<Option<Rul
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(target_os = "linux", test))]
+#[test]
+fn restored_file_verification_requires_the_original_object_and_empty_slot() -> io::Result<()> {
+    let fixture = tests::Fixture::new()?;
+    let path = fixture.scope.join("candidate");
+    std::fs::write(&path, b"retained")?;
+    let inspection = fixture.guard.inspect_file(&path)?;
+    assert_eq!(inspection.access, Access::Allowed);
+    let slot = Uuid::new_v4();
+    let fingerprint = &inspection.fingerprint;
+
+    fixture.guard.quarantine_file(&path, fingerprint, slot)?;
+    assert!(
+        !fixture
+            .guard
+            .verify_file_restored(&path, fingerprint, slot)?
+    );
+    fixture.guard.restore_file(&path, fingerprint, slot)?;
+    assert!(
+        fixture
+            .guard
+            .verify_file_restored(&path, fingerprint, slot)?
+    );
+
+    std::fs::rename(&path, fixture.scope.join("retained-original"))?;
+    std::fs::write(&path, b"retained")?;
+    assert!(
+        !fixture
+            .guard
+            .verify_file_restored(&path, fingerprint, slot)?
+    );
+    Ok(())
+}

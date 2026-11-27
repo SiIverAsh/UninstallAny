@@ -73,6 +73,49 @@ MSVC 构建静态链接 WebView2 加载器，gnullvm 构建从本次 Cargo 输�
 需要从现有二进制打包时可传入 `--binary`，并为动态链接的 Tauri 二进制显式传入 `--windows-loader`。
 机器级 MSI 提权助手通过独立 MSI 安装包交付。[Windows MSI 打包与验收](windows-mvp-verification.md#windows-x64-msi-预览安装包)
 
+## CLI 归档
+
+macOS 和 Linux 可加 `--cli` 生成终端版。
+归档名称包含 `UninstallAny-CLI`，包内提供 `uninstallany` 和使用说明。
+解压后直接运行 `./uninstallany list`。[CLI 用法](cli.md)
+
+```sh
+python3 -B scripts/package_release.py --cli
+```
+
+### Debian 和 Ubuntu 卸载助手
+
+Debian 包卸载需要独立的 `uninstallany-dpkg-helper` 安装包。
+使用 glibc 2.31 或更早的链接基线生成助手，再将助手和 PolicyKit 策略打包为 `.deb`。
+
+```sh
+cargo build --offline --locked --release -p uninstallany-linux \
+  --features dpkg-helper --bin uninstallany-dpkg-helper \
+  --target x86_64-unknown-linux-gnu
+python3 -B scripts/package_dpkg_helper.py \
+  --binary target/x86_64-unknown-linux-gnu/release/uninstallany-dpkg-helper \
+  --arch amd64
+```
+
+arm64 构建使用目标 `aarch64-unknown-linux-gnu` 和 `--arch arm64`，并在 `--binary` 路径中使用该目标。
+发布前在目标发行版核对 glibc、dpkg 和 PolicyKit 兼容性。
+由管理员从可信来源安装 `.deb`，CLI 由普通用户从交互式终端运行。
+卸载授权需要当前活动会话的 PolicyKit 认证代理。
+助手只处理经确认的单包移除，遇到保留状态、受保护包或无法核验的 dpkg 配置时会拒绝。
+
+### Arch Linux 卸载助手
+
+pacman 卸载使用独立的 `uninstallany-pacman-helper` 包。
+在已配置 Arch Linux 原生构建工具、pkgconf 和 libalpm 的环境中，以普通用户从源码构建。
+
+```sh
+cd packaging/arch-pacman-helper
+makepkg
+```
+
+管理员可从可信来源安装生成的软件包。CLI 由普通用户运行，并通过活动会话的 PolicyKit 认证代理请求单次授权。
+助手使用系统的 libalpm。更新 libalpm ABI 后，需要为目标系统重新构建助手。
+
 ## 发布包验收
 
 1. 用生成的 `.sha256` 核对归档，解压后检查程序与可执行权限。

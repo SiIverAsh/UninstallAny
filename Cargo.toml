@@ -6,6 +6,7 @@ members = [
     "crates/uninstallany-macos",
     "crates/uninstallany-linux",
     "crates/uninstallany-gui",
+    "crates/uninstallany-cli",
 ]
 resolver = "3"
 

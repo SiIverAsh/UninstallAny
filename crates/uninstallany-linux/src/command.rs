@@ -4,6 +4,7 @@ use std::{
     fs,
     io::{self, Read},
     os::unix::fs::MetadataExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
@@ -54,14 +55,32 @@ impl Program {
         // Executables are external system programs, not cleanup targets. Accept
         // common /bin aliases only after resolving and checking every ancestor.
         let path = fs::canonicalize(path)?;
-        let identity = trusted_identity(&path)?;
-        Ok(Self { path, identity })
+        Self::fixed(&path)
     }
 
-    pub(crate) fn command(&self, home: &Path, data: &Path) -> io::Result<Command> {
+    pub(crate) fn fixed(path: &Path) -> io::Result<Self> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected an absolute executable path",
+            ));
+        }
+        let identity = trusted_identity(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            identity,
+        })
+    }
+
+    pub(crate) fn revalidate(&self) -> io::Result<()> {
         if trusted_identity(&self.path)? != self.identity {
             return Err(io::Error::other("the package-manager executable changed"));
         }
+        Ok(())
+    }
+
+    pub(crate) fn command(&self, home: &Path, data: &Path) -> io::Result<Command> {
+        self.revalidate()?;
         let mut command = Command::new(&self.path);
         command
             .env_clear()
@@ -80,6 +99,22 @@ impl Program {
 }
 
 fn trusted_identity(path: &Path) -> io::Result<Identity> {
+    let entry = trusted_regular_file(path)?;
+    if entry.mode() & 0o111 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "untrusted package-manager executable",
+        ));
+    }
+    Ok(Identity {
+        device: entry.dev(),
+        inode: entry.ino(),
+        size: entry.size(),
+        modified: (entry.mtime(), entry.mtime_nsec()),
+    })
+}
+
+pub(crate) fn trusted_regular_file(path: &Path) -> io::Result<fs::Metadata> {
     let denied = || {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -93,19 +128,10 @@ fn trusted_identity(path: &Path) -> io::Result<Identity> {
         }
     }
     let entry = fs::symlink_metadata(path)?;
-    if !entry.is_file()
-        || entry.uid() != 0
-        || entry.mode() & 0o022 != 0
-        || entry.mode() & 0o111 == 0
-    {
+    if !entry.is_file() || entry.uid() != 0 || entry.mode() & 0o022 != 0 {
         return Err(denied());
     }
-    Ok(Identity {
-        device: entry.dev(),
-        inode: entry.ino(),
-        size: entry.size(),
-        modified: (entry.mtime(), entry.mtime_nsec()),
-    })
+    Ok(entry)
 }
 
 pub(crate) fn query(
@@ -115,31 +141,59 @@ pub(crate) fn query(
     args: &[&str],
     cancel: &Cancellation,
 ) -> Result<String> {
+    let (output, _) = query_output(program, home, data, args, cancel)?;
+    Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn query_strict(
+    program: &Program,
+    home: &Path,
+    data: &Path,
+    args: &[&str],
+    cancel: &Cancellation,
+) -> Result<String> {
+    let (output, diagnostics) = query_output(program, home, data, args, cancel)?;
+    if !diagnostics.is_empty() {
+        return Err(Error::Rejected(format!(
+            "package query returned diagnostics: {}",
+            diagnostics.trim()
+        )));
+    }
+    Ok(output)
+}
+
+fn query_output(
+    program: &Program,
+    home: &Path,
+    data: &Path,
+    args: &[&str],
+    cancel: &Cancellation,
+) -> Result<(String, String)> {
     let mut command = program.command(home, data)?;
     command.args(args);
-    let (status, output, diagnostics) = capture(&mut command, Some(cancel))?;
+    let (status, output, diagnostics) = capture(&mut command, Stdio::null(), Some(cancel))?;
     if !status.success() {
         return Err(Error::Rejected(format!(
             "package query exited with {status}: {}",
             diagnostics.trim()
         )));
     }
-    String::from_utf8(output)
-        .map_err(|_| Error::Rejected("package query returned invalid UTF-8".into()))
+    let output = String::from_utf8(output)
+        .map_err(|_| Error::Rejected("package query returned invalid UTF-8".into()))?;
+    Ok((output, diagnostics))
 }
 
 pub(crate) fn run_confirmed(
-    program: Program,
-    home: &Path,
-    data: &Path,
+    command: Command,
     args: Vec<OsString>,
+    input: Stdio,
+    cancel: &Cancellation,
 ) -> Result<NativeResult> {
-    let mut command = program.command(home, data)?;
-    command.args(args);
-    let (status, output, diagnostics) = capture(&mut command, None)?;
+    let (status, output, diagnostics) = run_approved(command, args, input, cancel)?;
     if !status.success() && !diagnostics.trim().is_empty() {
         return Err(Error::Rejected(format!(
-            "package removal exited with {status}: {}",
+            "package manager command exited with {status}: {}",
             diagnostics.trim()
         )));
     }
@@ -149,6 +203,19 @@ pub(crate) fn run_confirmed(
     })
 }
 
+pub(crate) fn run_approved(
+    mut command: Command,
+    args: Vec<OsString>,
+    input: Stdio,
+    cancel: &Cancellation,
+) -> Result<(ExitStatus, Vec<u8>, String)> {
+    // The CLI handles Ctrl+C for its own work. The terminal must not forward
+    // that signal to an in-flight native package transaction.
+    command.process_group(0).args(args);
+    cancel.check()?;
+    capture(&mut command, input, None)
+}
+
 pub(crate) struct NativeResult {
     pub status: ExitStatus,
     pub output: String,
@@ -156,13 +223,14 @@ pub(crate) struct NativeResult {
 
 fn capture(
     command: &mut Command,
+    input: Stdio,
     cancel: Option<&Cancellation>,
 ) -> Result<(ExitStatus, Vec<u8>, String)> {
     if let Some(cancel) = cancel {
         cancel.check()?;
     }
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(input)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
