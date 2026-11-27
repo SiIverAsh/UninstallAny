@@ -68,7 +68,7 @@ Contributions of all kinds are welcome—whether it's fixing a bug, adding lefto
 | `apps/macos-host` | Tauri desktop host for macOS & Windows |
 | `frontend/` | React + TypeScript + Tailwind CSS web UI for the Tauri desktop host |
 | `packaging/` & `scripts/` | System package helpers (`dpkg`, `rpm`, `pacman`) and release packaging scripts |
-| `docs/` | Technical architecture, CLI guide, custom rules, packaging, and test guides |
+| `docs/` | CLI guide, custom cleanup rules, and offline release packaging |
 
 ### Local Development Setup
 
@@ -118,7 +118,6 @@ python3 -B -m unittest discover -s scripts -p 'test_*.py'
 4. Open a pull request explaining what changed, why, and how you tested it.
 
 ### Further Reading
-- [Architecture Overview](docs/architecture.md)
 - [CLI Guide](docs/cli.md)
 - [Custom Cleanup Rules](docs/custom-rules.md)
 - [Offline Release Packaging](docs/release-packaging.md)

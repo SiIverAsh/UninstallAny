@@ -71,7 +71,7 @@ Windows 默认从 `apps/macos-host` 构建 `uninstallany-desktop.exe`，并嵌�
 MSVC 构建静态链接 WebView2 加载器，gnullvm 构建从本次 Cargo 输出取得配套的 x64 `WebView2Loader.dll` 并随 ZIP 交付。
 解压时保留包内文件在同一目录，以普通用户启动后使用。
 需要从现有二进制打包时可传入 `--binary`，并为动态链接的 Tauri 二进制显式传入 `--windows-loader`。
-机器级 MSI 提权助手通过独立 MSI 安装包交付。[Windows MSI 打包与验收](windows-mvp-verification.md#windows-x64-msi-预览安装包)
+机器级 MSI 提权助手通过独立 MSI 安装包交付，可使用 `scripts/package_windows_installer.py` 打包。
 
 ## CLI 归档
 
@@ -122,7 +122,7 @@ makepkg
    macOS 可以通过 `codesign --verify --strict UninstallAny.app` 检查本地签名。
 2. 在目标平台干净测试机断网启动，观察运行库、字体和显卡是否兼容。
    核对应用列表、残留预览、隔离与还原流程。
-3. 按[架构文档的离线和性能方案](architecture.md#离线和性能)记录冷启动、空闲内存和下载包大小。
+3. 记录冷启动耗时、空闲内存和下载包大小（目标低于 15,000,000 字节）。
    Windows 和 Linux 的交叉检查结果不能替代目标平台的打包和运行验收。
 
 打包工具回归测试使用 Python 标准库。

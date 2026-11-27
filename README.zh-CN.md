@@ -68,7 +68,7 @@ UninstallAny 是一款用 Rust 编写的跨平台开源应用卸载与残留清�
 | `apps/macos-host` | macOS 与 Windows 的 Tauri 桌面宿主 |
 | `frontend/` | Tauri 桌面端使用的 React + TypeScript + Tailwind CSS 前端 |
 | `packaging/` 与 `scripts/` | 系统包卸载助手（`dpkg`、`rpm`、`pacman`）及发行打包脚本 |
-| `docs/` | 架构设计、CLI 说明、自定义规则、打包与测试文档 |
+| `docs/` | CLI 说明、自定义规则与离线发行打包文档 |
 
 ### 本地开发环境
 
@@ -118,7 +118,6 @@ python3 -B -m unittest discover -s scripts -p 'test_*.py'
 4. 提交 PR，简要说明改动内容、原因以及你的验证方式。
 
 ### 更多文档
-- [架构设计](docs/architecture.md)
 - [命令行使用说明](docs/cli.md)
 - [自定义残留扫描规则](docs/custom-rules.md)
 - [离线发行打包说明](docs/release-packaging.md)
